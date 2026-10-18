@@ -54,8 +54,11 @@ struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; b
 static const int MAX_CLIENTS = 96;
 Dev clients[MAX_CLIENTS]; int numClients = 0;
 
+// User-managed domain lists, persisted one domain per line. Small enough to scan linearly.
 static const int MAX_CUSTOM = 200;
-String customDom[MAX_CUSTOM]; uint64_t customHash[MAX_CUSTOM]; int numCustom = 0;
+struct DomList { const char* path; String dom[MAX_CUSTOM]; uint64_t hash[MAX_CUSTOM]; int n; };
+DomList customList = { "/custom.txt" };   // always blocked (plus subdomains)
+DomList allowList  = { "/allow.txt" };    // never blocked (plus subdomains), overrides the blocklist
 
 static const int MAX_BAN = 32;
 uint32_t bannedIP[MAX_BAN]; int numBanned = 0;
@@ -137,13 +140,13 @@ static bool inFlash(uint64_t h) {
   return false;
 }
 
-static bool inCustom(uint64_t h) { for (int i = 0; i < numCustom; i++) if (customHash[i] == h) return true; return false; }
+static bool inList(const DomList& L, uint64_t h) { for (int i = 0; i < L.n; i++) if (L.hash[i] == h) return true; return false; }
 
 // Only flash results are cached: the flash list only changes via reopenBlocklist(), which
 // rebuilds the index and clears the cache. Custom domains change at runtime, so they're
 // checked uncached (a short linear scan) to avoid serving stale answers.
 static bool isBlockedHash(uint64_t h) {
-  if (inCustom(h)) return true;
+  if (inList(customList, h)) return true;
   uint32_t slot = h & (CACHE_SIZE - 1);
   if (cacheValid[slot]) {
     uint8_t want[HASH_BYTES]; packHash(h, want);
@@ -158,43 +161,50 @@ static bool isBlockedHash(uint64_t h) {
   return res;
 }
 
-static bool isBlocked(const char* domain) {
+// Walks the domain and its parent suffixes down to two labels (a.b.example.com ->
+// b.example.com -> example.com) and returns true if pred() matches any of them.
+template <typename F> static bool anySuffix(const char* domain, F pred) {
   const char* p = domain;
   while (p && *p) {
-    uint64_t h = fnv40(p, strlen(p));
-    if (isBlockedHash(h)) return true;
+    if (pred(fnv40(p, strlen(p)))) return true;
     const char* dot = strchr(p, '.'); if (!dot) break;
     const char* next = dot + 1; if (!strchr(next, '.')) break; p = next;
   }
   return false;
 }
+static bool isBlocked(const char* domain) {
+  if (allowList.n && anySuffix(domain, [](uint64_t h) { return inList(allowList, h); })) return false;
+  return anySuffix(domain, isBlockedHash);
+}
 
 // ---------- persistence ----------
-static void loadCustom() {
-  numCustom = 0; File f = LittleFS.open("/custom.txt", "r"); if (!f) return;
-  while (f.available() && numCustom < MAX_CUSTOM) {
+static void loadList(DomList& L) {
+  L.n = 0; if (!LittleFS.exists(L.path)) return;
+  File f = LittleFS.open(L.path, "r"); if (!f) return;
+  while (f.available() && L.n < MAX_CUSTOM) {
     String l = f.readStringUntil('\n'); l.trim(); l.toLowerCase();
-    if (l.length() && l.indexOf('.') > 0) { customDom[numCustom] = l; customHash[numCustom] = fnv40(l.c_str(), l.length()); numCustom++; }
+    if (l.length() && l.indexOf('.') > 0) { L.dom[L.n] = l; L.hash[L.n] = fnv40(l.c_str(), l.length()); L.n++; }
   }
   f.close();
 }
-static void saveCustom() { File f = LittleFS.open("/custom.txt", "w"); if (!f) return; for (int i = 0; i < numCustom; i++) f.println(customDom[i]); f.close(); }
-static bool addCustom(String d) {
+static void saveList(const DomList& L) { File f = LittleFS.open(L.path, "w"); if (!f) return; for (int i = 0; i < L.n; i++) f.println(L.dom[i]); f.close(); }
+static bool addToList(DomList& L, String d) {
   d.trim(); d.toLowerCase(); if (d.startsWith("www.")) d = d.substring(4);
-  if (!d.length() || d.indexOf('.') < 0 || numCustom >= MAX_CUSTOM) return false;
-  for (int i = 0; i < numCustom; i++) if (customDom[i] == d) return false;
-  customDom[numCustom] = d; customHash[numCustom] = fnv40(d.c_str(), d.length()); numCustom++; saveCustom(); return true;
+  if (!d.length() || d.indexOf('.') < 0 || L.n >= MAX_CUSTOM) return false;
+  for (int i = 0; i < L.n; i++) if (L.dom[i] == d) return false;
+  L.dom[L.n] = d; L.hash[L.n] = fnv40(d.c_str(), d.length()); L.n++; saveList(L); return true;
 }
-static void removeCustom(String d) {
-  d.toLowerCase();
-  for (int i = 0; i < numCustom; i++) if (customDom[i] == d) {
-    for (int j = i; j < numCustom - 1; j++) { customDom[j] = customDom[j+1]; customHash[j] = customHash[j+1]; }
-    numCustom--; saveCustom(); return;
+static void removeFromList(DomList& L, String d) {
+  d.trim(); d.toLowerCase();
+  for (int i = 0; i < L.n; i++) if (L.dom[i] == d) {
+    for (int j = i; j < L.n - 1; j++) { L.dom[j] = L.dom[j+1]; L.hash[j] = L.hash[j+1]; }
+    L.n--; saveList(L); return;
   }
 }
 static bool isBannedIP(uint32_t ip) { for (int i = 0; i < numBanned; i++) if (bannedIP[i] == ip) return true; return false; }
 static void loadBanned() {
-  numBanned = 0; File f = LittleFS.open("/banned.txt", "r"); if (!f) return;
+  numBanned = 0; if (!LittleFS.exists("/banned.txt")) return;
+  File f = LittleFS.open("/banned.txt", "r"); if (!f) return;
   while (f.available() && numBanned < MAX_BAN) { String l = f.readStringUntil('\n'); l.trim(); IPAddress ip; if (l.length() && ip.fromString(l)) bannedIP[numBanned++] = (uint32_t)ip; }
   f.close();
 }
@@ -330,8 +340,12 @@ static void handleStats() {
              ",\"clients\":[";
   for (int i = 0; i < numClients; i++) { Dev& c = clients[i]; IPAddress ip(c.ip);
     j += (i ? "," : ""); j += "{\"ip\":\"" + ip.toString() + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
-  j += "],\"custom\":[";
-  for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += "\"" + jesc(customDom[i]) + "\""; }
+  auto listJson = [&](const char* key, const DomList& L) {
+    j += "],\""; j += key; j += "\":[";
+    for (int i = 0; i < L.n; i++) { j += (i ? "," : ""); j += "\"" + jesc(L.dom[i]) + "\""; }
+  };
+  listJson("custom", customList);
+  listJson("allow", allowList);
   j += "]}";
   web.send(200, "application/json", j);
 }
@@ -453,6 +467,7 @@ static void handleUpload() {
 
 // ---------- remote blocklist auto-update ----------
 static void loadUpdateCfg() {
+  if (!LittleFS.exists("/update.cfg")) return;
   File f = LittleFS.open("/update.cfg", "r"); if (!f) return;
   updateUrl = f.readStringUntil('\n'); updateUrl.trim();
   String iv = f.readStringUntil('\n'); iv.trim(); if (iv.length()) updateIntervalH = iv.toInt();
@@ -611,8 +626,8 @@ void setup() {
     Serial.printf("blocklist: %u domains\n", numHashes);
     buildFlashIndex();
   }
-  loadCustom(); loadBanned(); loadUpdateCfg();
-  Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
+  loadList(customList); loadList(allowList); loadBanned(); loadUpdateCfg();
+  Serial.printf("custom: %d, allowed: %d, banned: %d\n", customList.n, allowList.n, numBanned);
 
   // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
 #if CONFIG_IDF_TARGET_ESP32C3
@@ -639,8 +654,10 @@ void setup() {
   web.on("/", []() { web.send_P(200, "text/html", PAGE); });
   web.on("/stats.json", handleStats);
   web.on("/ban", handleBan);
-  web.on("/addblock", []() { if (!requireAuth()) return; addCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
-  web.on("/unblock", []() { if (!requireAuth()) return; removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
+  web.on("/addblock", []() { if (!requireAuth()) return; addToList(customList, web.arg("d")); web.send(200, "text/plain", "ok"); });
+  web.on("/unblock", []() { if (!requireAuth()) return; removeFromList(customList, web.arg("d")); web.send(200, "text/plain", "ok"); });
+  web.on("/allow", []() { if (!requireAuth()) return; addToList(allowList, web.arg("d")); web.send(200, "text/plain", "ok"); });
+  web.on("/unallow", []() { if (!requireAuth()) return; removeFromList(allowList, web.arg("d")); web.send(200, "text/plain", "ok"); });
   web.on("/pause", []() {                    // /pause?s=300  (0 or absent = indefinite)
     if (!requireAuth()) return;
     long s = web.hasArg("s") ? web.arg("s").toInt() : 0;
