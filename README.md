@@ -228,6 +228,10 @@ dig @<c3-ip> github.com        # -> real IP  (forwarded)
 - ✅ mDNS (`c3adblock.local`) for discovery
 - ✅ OTA — firmware + blocklist update over WiFi, plus scheduled remote blocklist pulls
 - ✅ Captive-portal WiFi setup (no hardcoded creds) + one-click browser web-installer
+- ✅ Allowlist (never-blocked domains) next to custom blocks
+- ✅ Primary + secondary upstream resolver, set on the dashboard, with automatic failover
+- ✅ Answer cache honouring TTLs (sized to the board: up to 128 entries in internal RAM, 1024 with PSRAM)
+- ✅ Remote blocklist downloads verified (TLS against Mozilla roots + optional `.sha256`)
 - ⬜ Bucketed prefix index — ~18 flash reads/lookup → ~1–2 (issue #3), the throughput win
 - ⬜ Act as the DHCP server (hand itself out as DNS) for true plug-and-play
 
