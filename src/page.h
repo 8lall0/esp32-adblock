@@ -52,8 +52,9 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 <h2>SECURITY</h2>
 <div style=margin-bottom:6px><input id=np type=password placeholder="new admin password" size=24 minlength=8><button onclick=setPass()>Change password</button> <span id=pmsg style=color:#8b949e></span></div>
 <div style="color:#8b949e;font-size:12px;margin-bottom:18px">used for the dashboard and network OTA; overrides <code>secrets.h</code>. Forgot it? Hold BOOT while powering on to reset it in the setup portal.</div>
-<h2>WIFI</h2>
-<div style=margin-bottom:18px><button onclick="if(confirm('Forget saved WiFi and reboot into the setup portal?'))forgetWifi()">Forget WiFi</button></div>
+<h2>DEVICE</h2>
+<div style=margin-bottom:18px><button onclick="if(confirm('Reboot the device? DNS is down for ~10 s.'))reboot()">Reboot</button>
+<button onclick="if(confirm('Forget saved WiFi and reboot into the setup portal?'))forgetWifi()">Forget WiFi</button> <span id=rbmsg style=color:#8b949e></span></div>
 </div><script>
 function fmt(n){return n.toLocaleString()}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -93,7 +94,9 @@ function saveUpd(){fetch('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'
 function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow',{headers:CSRF_HDRS}).then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
 function setPass(){let p=np.value;if(p.length<8){pmsg.textContent='8+ characters';return}
 fetch('/setpass',{method:'POST',headers:{...CSRF_HDRS,'Content-Type':'application/x-www-form-urlencoded'},body:'p='+encodeURIComponent(p)})
-.then(r=>r.text()).then(t=>{pmsg.textContent=t;np.value='';load()})}
+.then(async r=>{let t=await r.text();pmsg.textContent=t;np.value='';
+if(r.ok&&confirm('Password changed. Reboot now so network OTA uses it too? (DNS is down for ~10 s)'))reboot()})}
+function reboot(){fetch('/reboot',{headers:CSRF_HDRS}).then(r=>r.text()).then(t=>{rbmsg.textContent=t+', reconnecting...';setTimeout(()=>location.reload(),12000)})}
 function saveUp(){fetch('/setupstream?p='+encodeURIComponent(up0.value.trim())+'&s='+encodeURIComponent(up1.value.trim()),{headers:CSRF_HDRS})
 .then(r=>r.text()).then(t=>{upmsg.textContent=t;load()})}
 function forgetWifi(){fetch('/forgetwifi',{headers:CSRF_HDRS}).then(r=>r.text()).then(t=>alert(t))}

@@ -989,6 +989,7 @@ void setup() {
     saveUpstreams(); web.send(200, "text/plain", "ok");
   });
   web.on("/resume", []() { if (!requireAuth()) return; blockingOn = true; resumeAt = 0; web.send(200, "text/plain", "resumed"); });
+  web.on("/reboot", []() { if (!requireAuth()) return; web.send(200, "text/plain", "rebooting"); delay(300); ESP.restart(); });
   web.on("/forgetwifi", []() { if (!requireAuth()) return; web.send(200, "text/plain", "cleared — rebooting into setup portal");
     prefs.begin("wifi", false); prefs.clear(); prefs.end(); delay(500); ESP.restart(); });
   web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);      // blocklist OTA (auth inside handleUpload)

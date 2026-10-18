@@ -153,7 +153,7 @@ state-changing endpoint requires **HTTP Basic Auth** (user `WEB_USER`, password
 `WEB_PASS` from `secrets.h`, or the admin password set in the setup portal / dashboard,
 which takes precedence):
 
-- `/ban`, `/addblock`, `/unblock`, `/allow`, `/unallow`, `/forgetwifi`, `/setpass`
+- `/ban`, `/addblock`, `/unblock`, `/allow`, `/unallow`, `/forgetwifi`, `/setpass`, `/reboot`, `/setupstream`
 - `/upload`, `/update` (blocklist and firmware OTA)
 - `/setupdate`, `/fetchnow`
 
