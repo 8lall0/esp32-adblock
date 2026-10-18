@@ -4,6 +4,7 @@
 #include "esp_netif.h"
 #include "esp_netif_net_stack.h"
 #include "lwip/netif.h"
+#include "lwip/sockets.h"
 #include <LittleFS.h>
 #include "blocklist.h"
 #include "cache.h"
@@ -102,13 +103,13 @@ static const int DECISION_LOG = 32;
 static const char* const WHY_NAMES[] = { "upstream", "cache", "allowlisted", "paused", "no-list", "unparsed",
                                          "banned", "custom", "blocklist" };
 enum Why : uint8_t { W_UPSTREAM, W_CACHE, W_ALLOW, W_PAUSED, W_NOLIST, W_UNPARSED, W_BANNED, W_CUSTOM, W_LIST, W_COUNT };
-struct Decision { uint32_t t; Addr client; char domain[64]; uint16_t qtype; Why why; };
+struct Decision { uint32_t t; Addr client; char domain[64]; uint16_t qtype; Why why; bool tcp; };
 static Decision decisions[DECISION_LOG]; static int decisionNext = 0, decisionCount = 0;
 static uint32_t whyCount[W_COUNT];
-static void recordDecision(const Addr& client, const char* domain, uint16_t qtype, Why why) {
+static void recordDecision(const Addr& client, const char* domain, uint16_t qtype, Why why, bool tcp) {
   whyCount[why]++;
   Decision& d = decisions[decisionNext];
-  d.t = millis(); d.client = client; d.qtype = qtype; d.why = why;
+  d.t = millis(); d.client = client; d.qtype = qtype; d.why = why; d.tcp = tcp;
   strlcpy(d.domain, domain, sizeof(d.domain));
   decisionNext = (decisionNext + 1) % DECISION_LOG;
   if (decisionCount < DECISION_LOG) decisionCount++;
@@ -222,8 +223,9 @@ void setUpstreams(uint32_t primary, uint32_t secondary) {
   f.println(upstream[1] ? IPAddress(upstream[1]).toString() : String(""));
   f.close();
 }
-static void handleQuery(const Addr& client, uint16_t cport, int qlen) {
-  if (qlen < 13) return;
+// Decides the query in buf (shared by UDP and TCP). Returns the length of an answer now built
+// in buf (blocked or cached), or 0 if it must go upstream; *qendOut / *keyOut are for that.
+static int answerLocally(const Addr& client, int qlen, bool tcp, int* qendOut, uint64_t* keyOut) {
   char domain[256] = ""; uint16_t qtype = 0; int qend = 0;   // qend stays 0 if the question can't be parsed
   size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
   Dev* c = getClient(client);
@@ -238,18 +240,191 @@ static void handleQuery(const Addr& client, uint16_t cport, int qlen) {
     case BW_ALLOW:  why = W_ALLOW; break;
     default:        why = W_UPSTREAM;
   }
+  int rlen;
+  uint64_t key = 0;
   if (why >= W_BANNED) {
     if (!qend) qend = qlen;                        // banned client sent something unparseable
-    int rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++;
-    sendClient(client, cport, rlen);
+    rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++;
   } else {
     totalAllowed++; if (c) c->allowed++;
-    const uint64_t key = dl ? answerKey(buf, qlen, qend) : 0;
-    int rlen = cacheAnswer(buf, key, qend);
-    if (rlen) { sendClient(client, cport, rlen); if (why == W_UPSTREAM) why = W_CACHE; }
-    else      forwardUpstream(client, cport, qlen, qend, key);
+    key = dl ? answerKey(buf, qlen, qend) : 0;
+    rlen = cacheAnswer(buf, key, qend);
+    if (rlen && why == W_UPSTREAM) why = W_CACHE;
   }
-  recordDecision(client, domain, qtype, why);
+  recordDecision(client, domain, qtype, why, tcp);
+  *qendOut = qend; *keyOut = key;
+  return rlen;
+}
+static void handleQuery(const Addr& client, uint16_t cport, int qlen) {
+  if (qlen < 13) return;
+  int qend; uint64_t key;
+  int rlen = answerLocally(client, qlen, false, &qend, &key);
+  if (rlen) sendClient(client, cport, rlen);
+  else      forwardUpstream(client, cport, qlen, qend, key);
+}
+
+// ---------- DNS over TCP (RFC 7766) ----------
+// Clients retry over TCP when a UDP answer comes back truncated (TC bit), so without this
+// big answers (long TXT/DNSKEY/CNAME chains) failed. Each message is prefixed with a 2-byte
+// length. Queries are decided by answerLocally() like UDP ones; forwarded ones get their own
+// TCP connection to the upstream, and the answer is streamed back in chunks, so its size
+// (up to 64 KB) never has to fit in RAM. All sockets are non-blocking and polled from loop().
+// Connections are few because lwIP has 16 sockets in total (web server, OTA, fetches...).
+static const int MAX_TCP = 3;
+static const uint32_t TCP_IDLE_MS = 10000;
+static const int TCP_MAX_QUERY = 512;
+enum TcpState : uint8_t { T_FREE, T_READ, T_CONNECT, T_SENDQ, T_RELAY_LEN, T_RELAY };
+struct TcpConn {
+  TcpState st; int cfd, ufd; Addr client; uint32_t t; int upIdx; bool triedOther;
+  uint16_t qlen, have;                             // query: 2-byte length + body, read so far
+  uint8_t q[2 + TCP_MAX_QUERY];
+  uint32_t left;                                   // answer bytes still to relay
+  uint16_t outLen, outOff; uint8_t out[512];       // chunk waiting to be written to the client
+};
+static TcpConn tcpConns[MAX_TCP];
+static int tcpListen = -1;
+
+static void tcpCloseUp(TcpConn& c) { if (c.ufd >= 0) { close(c.ufd); c.ufd = -1; } }
+static void tcpClose(TcpConn& c) { tcpCloseUp(c); if (c.cfd >= 0) close(c.cfd); c.cfd = -1; c.st = T_FREE; }
+static void nonBlocking(int fd) { fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK); }
+// Writes as much of c.out as the socket takes; true once it's all gone.
+static bool tcpFlush(TcpConn& c) {
+  while (c.outOff < c.outLen) {
+    int n = send(c.cfd, c.out + c.outOff, c.outLen - c.outOff, MSG_DONTWAIT);
+    if (n > 0) { c.outOff += n; c.t = millis(); continue; }
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return false;
+    tcpClose(c); return false;
+  }
+  return true;
+}
+static bool tcpConnectUp(TcpConn& c, int idx) {
+  tcpCloseUp(c);
+  if (!upstream[idx]) return false;
+  c.ufd = socket(AF_INET, SOCK_STREAM, 0); if (c.ufd < 0) return false;
+  nonBlocking(c.ufd);
+  struct sockaddr_in sa = {}; sa.sin_family = AF_INET; sa.sin_port = htons(UPSTREAM_PORT); sa.sin_addr.s_addr = upstream[idx];
+  int r = connect(c.ufd, (struct sockaddr*)&sa, sizeof(sa));
+  if (r < 0 && errno != EINPROGRESS) { tcpCloseUp(c); return false; }
+  c.upIdx = idx; c.st = T_CONNECT; c.t = millis();
+  return true;
+}
+// Connect failed or upstream hung up early: try the other upstream once, else give up.
+static void tcpUpFailed(TcpConn& c) {
+  if (!c.triedOther && upstream[1] && tcpConnectUp(c, 1 - c.upIdx)) { c.triedOther = true; return; }
+  tcpClose(c);
+}
+static void tcpQueryComplete(TcpConn& c) {
+  memcpy(buf, c.q + 2, c.qlen);
+  int qend; uint64_t key;
+  int rlen = answerLocally(c.client, c.qlen, true, &qend, &key);
+  if (rlen) {                                      // blocked / cached: answer straight away
+    c.out[0] = rlen >> 8; c.out[1] = rlen & 0xFF;
+    if (rlen > (int)sizeof(c.out) - 2) { tcpClose(c); return; }
+    memcpy(c.out + 2, buf, rlen); c.outLen = rlen + 2; c.outOff = 0;
+    c.have = 0; c.st = T_READ;
+    tcpFlush(c);
+    return;
+  }
+  c.triedOther = false;
+  if (!tcpConnectUp(c, upActive)) tcpUpFailed(c);
+}
+static void tcpService(TcpConn& c) {
+  const uint32_t now = millis();
+  if (now - c.t > TCP_IDLE_MS) { tcpClose(c); return; }
+  if (c.outOff < c.outLen && !tcpFlush(c)) return; // finish pending output first
+  switch (c.st) {
+    case T_READ: {                                 // length prefix, then the query
+      const int want = c.have < 2 ? 2 - c.have : 2 + c.qlen - c.have;
+      int n = recv(c.cfd, c.q + c.have, want, MSG_DONTWAIT);
+      if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) { tcpClose(c); return; }
+      if (n < 0) return;
+      c.have += n; c.t = now;
+      if (c.have == 2) {
+        c.qlen = (c.q[0] << 8) | c.q[1];
+        if (c.qlen < 13 || c.qlen > TCP_MAX_QUERY) { tcpClose(c); return; }
+      }
+      if (c.have >= 2 && c.have == 2 + c.qlen) tcpQueryComplete(c);
+      return;
+    }
+    case T_CONNECT: {
+      fd_set w; FD_ZERO(&w); FD_SET(c.ufd, &w); struct timeval tv = { 0, 0 };
+      if (select(c.ufd + 1, nullptr, &w, nullptr, &tv) <= 0) {
+        if (now - c.t > 3000) tcpUpFailed(c);      // connect timeout
+        return;
+      }
+      int err = 0; socklen_t el = sizeof(err);
+      getsockopt(c.ufd, SOL_SOCKET, SO_ERROR, &err, &el);
+      if (err) { tcpUpFailed(c); return; }
+      c.st = T_SENDQ; c.outLen = 0; c.outOff = 0;  // the query is still in c.q (prefix included)
+      // fall through
+    }
+    case T_SENDQ: {
+      int n = send(c.ufd, c.q + c.outOff, 2 + c.qlen - c.outOff, MSG_DONTWAIT);
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+      if (n <= 0) { tcpUpFailed(c); return; }
+      c.outOff += n; c.t = now;
+      if (c.outOff < 2 + c.qlen) return;
+      c.outOff = 0; c.outLen = 0; c.have = 0; c.st = T_RELAY_LEN;
+      return;
+    }
+    case T_RELAY_LEN: {                            // upstream's 2-byte length goes to the client as-is
+      int n = recv(c.ufd, c.out + c.have, 2 - c.have, MSG_DONTWAIT);
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { if (now - c.t > 5000) tcpClose(c); return; }
+      if (n <= 0) { tcpUpFailed(c); return; }
+      c.have += n; c.t = now;
+      if (c.have < 2) return;
+      c.left = (c.out[0] << 8) | c.out[1];
+      c.outLen = 2; c.outOff = 0; c.st = T_RELAY;
+      tcpFlush(c);
+      return;
+    }
+    case T_RELAY: {
+      if (!c.left) {                               // answer done: next query on this connection
+        tcpCloseUp(c); c.have = 0; c.st = T_READ; return;
+      }
+      int n = recv(c.ufd, c.out, c.left < sizeof(c.out) ? c.left : sizeof(c.out), MSG_DONTWAIT);
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+      if (n <= 0) { tcpClose(c); return; }       // upstream hung up mid-answer
+      c.left -= n; c.outLen = n; c.outOff = 0; c.t = now;
+      tcpFlush(c);
+      return;
+    }
+    default: return;
+  }
+}
+// Accepts new connections and advances the existing ones. Returns true if anything happened.
+static bool handleTcp() {
+  if (tcpListen < 0) return false;
+  bool did = false;
+  struct sockaddr_in6 sa; socklen_t sl = sizeof(sa);
+  int fd = accept(tcpListen, (struct sockaddr*)&sa, &sl);
+  if (fd >= 0) {
+    did = true;
+    TcpConn* c = nullptr;
+    for (int i = 0; i < MAX_TCP; i++) if (tcpConns[i].st == T_FREE) { c = &tcpConns[i]; break; }
+    if (!c) close(fd);                             // all busy: the client retries
+    else {
+      nonBlocking(fd);
+      *c = {}; c->cfd = fd; c->ufd = -1; c->st = T_READ; c->t = millis();
+      c->client = {};
+      const uint8_t* a = (const uint8_t*)&sa.sin6_addr;
+      if (sa.sin6_family == AF_INET) memcpy(c->client.b, &((struct sockaddr_in*)&sa)->sin_addr, 4);
+      else if (!memcmp(a, "\0\0\0\0\0\0\0\0\0\0\xff\xff", 12)) memcpy(c->client.b, a + 12, 4);  // IPv4-mapped
+      else { c->client.v6 = true; memcpy(c->client.b, a, 16); }
+    }
+  }
+  for (int i = 0; i < MAX_TCP; i++) if (tcpConns[i].st != T_FREE) tcpService(tcpConns[i]);
+  return did;                                      // open connections alone don't keep loop() from idling
+}
+static void tcpBegin() {
+  for (int i = 0; i < MAX_TCP; i++) { tcpConns[i].st = T_FREE; tcpConns[i].cfd = tcpConns[i].ufd = -1; }
+  int fd = socket(AF_INET6, SOCK_STREAM, 0); if (fd < 0) return;
+  int off = 0; setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));   // dual-stack: IPv4 too
+  int on = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+  struct sockaddr_in6 sa = {}; sa.sin6_family = AF_INET6; sa.sin6_port = htons(DNS_PORT);
+  if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0 || listen(fd, MAX_TCP) < 0) { close(fd); return; }
+  nonBlocking(fd);
+  tcpListen = fd;
 }
 void dnsBegin() {
   initAnswerCache();
@@ -258,6 +433,7 @@ void dnsBegin() {
   upstreamSock.listen(IPAddress(0, 0, 0, 0), 0);     // ephemeral source port for upstream queries
   dnsSock.onPacket([](AsyncUDPPacket& p) { enqueuePkt(p, false); });
   upstreamSock.onPacket([](AsyncUDPPacket& p) { enqueuePkt(p, true); });
+  tcpBegin();
 }
 // Drain a burst per call (capped, so web/OTA still get a turn). Returns true if it did work.
 bool handleDns() {
@@ -270,6 +446,7 @@ bool handleDns() {
     free(k);
   }
   servicePending();
+  did |= handleTcp();
   if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
   return did;
 }
@@ -284,7 +461,7 @@ String dnsDebugJson() {
     const Decision& d = decisions[(decisionNext - 1 - i + DECISION_LOG) % DECISION_LOG];
     String dom; for (const char* p = d.domain; *p; p++) if (*p != '"' && *p != '\\' && (uint8_t)*p >= 0x20) dom += *p;
     j += (i ? "," : ""); j += "{\"ago\":"; j += (now - d.t) / 1000; j += ",\"client\":\""; j += addrStr(d.client);
-    j += "\",\"domain\":\""; j += dom; j += "\",\"qtype\":"; j += d.qtype; j += ",\"why\":\""; j += WHY_NAMES[d.why]; j += "\"}";
+    j += "\",\"domain\":\""; j += dom; j += "\",\"qtype\":"; j += d.qtype; j += ",\"why\":\""; j += WHY_NAMES[d.why]; j += "\""; if (d.tcp) j += ",\"tcp\":true"; j += "}";
   }
   return j + "]}";
 }
