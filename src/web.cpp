@@ -7,6 +7,7 @@
 #include "cache.h"
 #include "clients.h"
 #include "dns.h"
+#include "ipv6.h"
 #include "portal.h"
 #include "updates.h"
 
@@ -50,9 +51,10 @@ static void handleStats() {
              ",\"cacheHits\":" + cacheHits + ",\"cacheSlots\":" + cacheSlots +
              ",\"resumeIn\":" + (uint32_t)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0) +
              ",\"defcreds\":" + (defaultCreds() ? "true" : "false") +
+             ",\"ip6\":" + ipv6AddrsJson() + ",\"ra6\":" + (raEnabled ? "true" : "false") +
              ",\"clients\":[";
-  for (int i = 0; i < numClients; i++) { Dev& c = clients[i]; IPAddress ip(c.ip);
-    j += (i ? "," : ""); j += "{\"ip\":\"" + ip.toString() + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
+  for (int i = 0; i < numClients; i++) { Dev& c = clients[i];
+    j += (i ? "," : ""); j += "{\"ip\":\"" + addrStr(c.addr) + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
   auto listJson = [&](const char* key, const DomList& L) {
     j += "],\""; j += key; j += "\":[";
     for (int i = 0; i < L.n; i++) { j += (i ? "," : ""); j += "\"" + jesc(L.dom[i]) + "\""; }
@@ -86,7 +88,7 @@ static bool requireAuth() {
 }
 static void handleBan() {
   if (!requireAuth()) return;
-  IPAddress ip; if (ip.fromString(web.arg("ip"))) { Dev* c = getClient((uint32_t)ip); if (c) { c->banned = !c->banned; saveBanned(); } }
+  Addr a; if (addrParse(web.arg("ip"), a)) { Dev* c = getClient(a); if (c) { c->banned = !c->banned; saveBanned(); } }
   web.send(200, "text/plain", "ok");
 }
 
@@ -188,6 +190,12 @@ void webBegin() {
     setUpstreams((uint32_t)a, ss.length() ? (uint32_t)b : 0);
     web.send(200, "text/plain", "ok");
   });
+  web.on("/setra6", []() {                  // /setra6?on=1 : announce the device as IPv6 DNS server
+    if (!requireAuth()) return;
+    setRaEnabled(web.arg("on") == "1"); web.send(200, "text/plain", raEnabled ? "announcing" : "stopped (withdrawal sent)");
+  });
+  // Recent queries are browsing history, so unlike /stats.json this needs the admin login.
+  web.on("/debug.json", []() { if (!requireAuth()) return; web.send(200, "application/json", dnsDebugJson()); });
   web.on("/resume", []() { if (!requireAuth()) return; blockingOn = true; resumeAt = 0; web.send(200, "text/plain", "resumed"); });
   web.on("/reboot", []() { if (!requireAuth()) return; web.send(200, "text/plain", "rebooting"); delay(300); ESP.restart(); });
   web.on("/forgetwifi", []() { if (!requireAuth()) return; web.send(200, "text/plain", "cleared — rebooting into setup portal");

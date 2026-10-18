@@ -1,6 +1,9 @@
 #include "dns.h"
 #include <WiFi.h>
 #include <AsyncUDP.h>           // DNS sockets (raw lwIP: no 6-packet socket rx queue)
+#include "esp_netif.h"
+#include "esp_netif_net_stack.h"
+#include "lwip/netif.h"
 #include <LittleFS.h>
 #include "blocklist.h"
 #include "cache.h"
@@ -46,18 +49,70 @@ static int buildBlocked(int qend, uint16_t qtype) {
 // the sixth. AsyncUDP receives straight from lwIP; its callbacks (async_udp task) only copy
 // the datagram into pktQ, and loop() does all the DNS work, so no state is shared across
 // tasks except the queue itself.
-struct Pkt { uint32_t ip; uint16_t port; bool fromUpstream; uint16_t len; uint8_t data[]; };
+struct Pkt { Addr from; uint16_t port; bool fromUpstream; uint16_t len; uint8_t data[]; };
 static const int PKT_QUEUE = 64;
 static QueueHandle_t pktQ;
+// The sender address is read from the IP header in front of the payload. AsyncUDPPacket's own
+// remoteIP()/isIPv6() can't be trusted: AsyncUDP queues a *pointer* to lwIP's "current
+// packet source" global and reads it later from its own task, by which time it may describe
+// another packet (any IPv6 traffic on the LAN, e.g. neighbour discovery, flips the type).
+// IPv6 queries then showed up as bogus IPv4 clients, and IPv4 packets (including upstream
+// replies) were mistaken for IPv6 and dropped. Strict checks: exactly one header must match.
+static bool packetSource(AsyncUDPPacket& p, Addr& from) {
+  const uint8_t* d = p.data(); const size_t n = p.length();
+  const uint8_t* h4 = d - 8 - 20;                  // IPv4 header without options, then UDP
+  const uint8_t* h6 = d - 8 - 40;                  // IPv6 header without extension headers, then UDP
+  const bool v4 = h4[0] == 0x45 && h4[9] == 17 && (size_t)((h4[2] << 8) | h4[3]) == n + 28;
+  const bool v6 = (h6[0] >> 4) == 6 && h6[6] == 17 && (size_t)((h6[4] << 8) | h6[5]) == n + 8;
+  if (v4 == v6) return false;
+  from = {};
+  if (v4) memcpy(from.b, h4 + 12, 4);
+  else  { from.v6 = true; memcpy(from.b, h6 + 8, 16); }
+  return true;
+}
 static void enqueuePkt(AsyncUDPPacket& p, bool fromUpstream) {
   size_t n = p.length();
-  if (p.isIPv6() || n < 12 || n > sizeof(buf)) return;
+  if (n < 12 || n > sizeof(buf)) return;
+  Addr from;
+  if (!packetSource(p, from) || (fromUpstream && from.v6)) return;   // upstreams are IPv4
   Pkt* k = (Pkt*)malloc(sizeof(Pkt) + n); if (!k) return;
-  k->ip = (uint32_t)p.remoteIP(); k->port = p.remotePort(); k->fromUpstream = fromUpstream; k->len = n;
+  k->from = from;
+  k->port = p.remotePort(); k->fromUpstream = fromUpstream; k->len = n;
   memcpy(k->data, p.data(), n);
   if (xQueueSend(pktQ, &k, 0) != pdTRUE) free(k);  // full: drop, the client retries
 }
-static void sendTo(AsyncUDP& sock, uint32_t ip, uint16_t port, int len) { sock.writeTo(buf, len, IPAddress(ip), port); }
+static void sendUpstream(uint32_t ip, int len) { upstreamSock.writeTo(buf, len, IPAddress(ip), UPSTREAM_PORT); }
+// IPv6 clients are usually link-local (fe80::/10), which lwIP only routes with a zone (the
+// interface). AsyncUDP's IPv6Address overload leaves the zone field uninitialised, so whether
+// a reply went out depended on stack garbage; build the address here with the zone set.
+static void sendClient(const Addr& to, uint16_t port, int len) {
+  if (!to.v6) { uint32_t ip; memcpy(&ip, to.b, 4); dnsSock.writeTo(buf, len, IPAddress(ip), port); return; }
+  ip_addr_t d = {};
+  d.type = IPADDR_TYPE_V6;
+  memcpy(d.u_addr.ip6.addr, to.b, 16);
+  esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  struct netif* nif = sta ? (struct netif*)esp_netif_get_netif_impl(sta) : nullptr;
+  if (nif) ip6_addr_assign_zone(ip_2_ip6(&d), IP6_UNICAST, nif);
+  dnsSock.writeTo(buf, len, &d, port, TCPIP_ADAPTER_IF_STA);
+}
+
+// Why each query got the answer it did, for /debug.json (diagnosing "a blocked domain
+// resolved" reports). Counters per reason plus the last DECISION_LOG queries.
+static const int DECISION_LOG = 32;
+static const char* const WHY_NAMES[] = { "upstream", "cache", "allowlisted", "paused", "no-list", "unparsed",
+                                         "banned", "custom", "blocklist" };
+enum Why : uint8_t { W_UPSTREAM, W_CACHE, W_ALLOW, W_PAUSED, W_NOLIST, W_UNPARSED, W_BANNED, W_CUSTOM, W_LIST, W_COUNT };
+struct Decision { uint32_t t; Addr client; char domain[64]; uint16_t qtype; Why why; };
+static Decision decisions[DECISION_LOG]; static int decisionNext = 0, decisionCount = 0;
+static uint32_t whyCount[W_COUNT];
+static void recordDecision(const Addr& client, const char* domain, uint16_t qtype, Why why) {
+  whyCount[why]++;
+  Decision& d = decisions[decisionNext];
+  d.t = millis(); d.client = client; d.qtype = qtype; d.why = why;
+  strlcpy(d.domain, domain, sizeof(d.domain));
+  decisionNext = (decisionNext + 1) % DECISION_LOG;
+  if (decisionCount < DECISION_LOG) decisionCount++;
+}
 
 // Upstream forwarding is asynchronous: a query is sent with a fresh random txid and parked
 // in this table, and replies are matched back to their client whenever they arrive. The old
@@ -76,7 +131,7 @@ static const uint8_t  FAILOVER_AFTER = 3;
 static const uint32_t PRIMARY_RETRY_MS = 60000;
 struct Pending {
   bool used; uint8_t sentMask;                     // bit i: sent to upstream[i]
-  uint16_t wid, cport, plen, ql; uint8_t cid0, cid1; uint32_t cip, t0;
+  uint16_t wid, cport, plen, ql; uint8_t cid0, cid1; Addr client; uint32_t t0;
   uint8_t pkt[300];                                // whole query (for the retry); ql = question bytes after the header
   uint64_t ckey;                                   // answer-cache key, 0 = don't cache the reply
 };
@@ -87,10 +142,10 @@ static uint8_t upMisses[2] = { 0, 0 }; static uint32_t upSwitchedAt = 0;
 static int upstreamIndex(uint32_t ip) { for (int i = 0; i < 2; i++) if (upstream[i] && upstream[i] == ip) return i; return -1; }
 static void sendPending(Pending& p, int u) {
   memcpy(buf, p.pkt, p.plen);
-  sendTo(upstreamSock, upstream[u], UPSTREAM_PORT, p.plen);
+  sendUpstream(upstream[u], p.plen);
   p.sentMask |= 1 << u;
 }
-static void forwardUpstream(uint32_t cip, uint16_t cport, int qlen, int qend, uint64_t ckey) {
+static void forwardUpstream(const Addr& client, uint16_t cport, int qlen, int qend, uint64_t ckey) {
   Pending* p = nullptr;
   for (int i = 0; i < MAX_PENDING; i++) {          // free slot, else evict the oldest
     if (!pending[i].used) { p = &pending[i]; break; }
@@ -101,7 +156,7 @@ static void forwardUpstream(uint32_t cip, uint16_t cport, int qlen, int qend, ui
     wid = (uint16_t)esp_random(); clash = false;
     for (int i = 0; i < MAX_PENDING; i++) if (pending[i].used && &pending[i] != p && pending[i].wid == wid) clash = true;
   } while (clash);
-  p->used = true; p->sentMask = 0; p->wid = wid; p->cip = cip; p->cport = cport;
+  p->used = true; p->sentMask = 0; p->wid = wid; p->client = client; p->cport = cport;
   p->cid0 = buf[0]; p->cid1 = buf[1]; p->t0 = millis();
   buf[0] = wid >> 8; buf[1] = wid & 0xFF;
   const bool fits = qlen <= (int)sizeof(p->pkt);
@@ -109,10 +164,11 @@ static void forwardUpstream(uint32_t cip, uint16_t cport, int qlen, int qend, ui
   p->ql = (fits && qend > 12 && qend <= qlen) ? qend - 12 : 0;
   if (fits) memcpy(p->pkt, buf, qlen);
   p->ckey = p->ql ? ckey : 0;
-  sendTo(upstreamSock, upstream[upActive], UPSTREAM_PORT, qlen);
+  sendUpstream(upstream[upActive], qlen);
   p->sentMask = 1 << upActive;
 }
-static void handleReply(uint32_t ip, uint16_t port, int n) {
+static void handleReply(const Addr& from, uint16_t port, int n) {
+  uint32_t ip; memcpy(&ip, from.b, 4);
   int u = upstreamIndex(ip);
   if (u < 0 || port != UPSTREAM_PORT) return;
   const uint16_t wid = (buf[0] << 8) | buf[1];
@@ -123,7 +179,7 @@ static void handleReply(uint32_t ip, uint16_t port, int n) {
     buf[0] = p.cid0; buf[1] = p.cid1; p.used = false;
     upMisses[u] = 0;
     cacheStore(buf, p.ckey, n, p.ql);
-    sendTo(dnsSock, p.cip, p.cport, n);
+    sendClient(p.client, p.cport, n);
     return;
   }
 }
@@ -166,29 +222,39 @@ void setUpstreams(uint32_t primary, uint32_t secondary) {
   f.println(upstream[1] ? IPAddress(upstream[1]).toString() : String(""));
   f.close();
 }
-static void handleQuery(uint32_t cip, uint16_t cport, int qlen) {
+static void handleQuery(const Addr& client, uint16_t cport, int qlen) {
   if (qlen < 13) return;
-  char domain[256]; uint16_t qtype = 0; int qend = 0;   // qend stays 0 if the question can't be parsed
+  char domain[256] = ""; uint16_t qtype = 0; int qend = 0;   // qend stays 0 if the question can't be parsed
   size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
-  Dev* c = getClient(cip);
-  bool ban = c && c->banned;
-  bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
-  if (blocked) {
+  Dev* c = getClient(client);
+  Why why;
+  if (c && c->banned)  why = W_BANNED;
+  else if (!dl)        why = W_UNPARSED;
+  else if (!blockingOn) why = W_PAUSED;
+  else if (!numHashes) why = W_NOLIST;               // list being replaced: fail open
+  else switch (blockReason(domain)) {
+    case BW_LIST:   why = W_LIST; break;
+    case BW_CUSTOM: why = W_CUSTOM; break;
+    case BW_ALLOW:  why = W_ALLOW; break;
+    default:        why = W_UPSTREAM;
+  }
+  if (why >= W_BANNED) {
     if (!qend) qend = qlen;                        // banned client sent something unparseable
     int rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++;
-    sendTo(dnsSock, cip, cport, rlen);
+    sendClient(client, cport, rlen);
   } else {
     totalAllowed++; if (c) c->allowed++;
     const uint64_t key = dl ? answerKey(buf, qlen, qend) : 0;
     int rlen = cacheAnswer(buf, key, qend);
-    if (rlen) sendTo(dnsSock, cip, cport, rlen);
-    else      forwardUpstream(cip, cport, qlen, qend, key);
+    if (rlen) { sendClient(client, cport, rlen); if (why == W_UPSTREAM) why = W_CACHE; }
+    else      forwardUpstream(client, cport, qlen, qend, key);
   }
+  recordDecision(client, domain, qtype, why);
 }
 void dnsBegin() {
   initAnswerCache();
   pktQ = xQueueCreate(PKT_QUEUE, sizeof(Pkt*));
-  dnsSock.listen(IPAddress(0, 0, 0, 0), DNS_PORT);   // IPv4 only: the client table keys on IPv4
+  dnsSock.listen(DNS_PORT);                          // IPv4 + IPv6
   upstreamSock.listen(IPAddress(0, 0, 0, 0), 0);     // ephemeral source port for upstream queries
   dnsSock.onPacket([](AsyncUDPPacket& p) { enqueuePkt(p, false); });
   upstreamSock.onPacket([](AsyncUDPPacket& p) { enqueuePkt(p, true); });
@@ -199,11 +265,26 @@ bool handleDns() {
   for (int budget = 0; budget < 32 && xQueueReceive(pktQ, &k, 0) == pdTRUE; budget++) {
     did = true;
     memcpy(buf, k->data, k->len);
-    if (k->fromUpstream) handleReply(k->ip, k->port, k->len);
-    else                 handleQuery(k->ip, k->port, k->len);
+    if (k->fromUpstream) handleReply(k->from, k->port, k->len);
+    else                 handleQuery(k->from, k->port, k->len);
     free(k);
   }
   servicePending();
   if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
   return did;
+}
+
+String dnsDebugJson() {
+  String j = "{\"counts\":{";
+  for (int i = 0; i < W_COUNT; i++) { j += (i ? ",\"" : "\""); j += WHY_NAMES[i]; j += "\":"; j += whyCount[i]; }
+  j += "},\"blocking\":"; j += blockingOn ? "true" : "false";
+  j += ",\"recent\":[";
+  const uint32_t now = millis();
+  for (int i = 0; i < decisionCount; i++) {          // newest first
+    const Decision& d = decisions[(decisionNext - 1 - i + DECISION_LOG) % DECISION_LOG];
+    String dom; for (const char* p = d.domain; *p; p++) if (*p != '"' && *p != '\\' && (uint8_t)*p >= 0x20) dom += *p;
+    j += (i ? "," : ""); j += "{\"ago\":"; j += (now - d.t) / 1000; j += ",\"client\":\""; j += addrStr(d.client);
+    j += "\",\"domain\":\""; j += dom; j += "\",\"qtype\":"; j += d.qtype; j += ",\"why\":\""; j += WHY_NAMES[d.why]; j += "\"}";
+  }
+  return j + "]}";
 }

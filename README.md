@@ -109,6 +109,21 @@ un-blocks that exact entry — it can't carve a subdomain out of a blocked paren
 can't be downloaded the build stops instead of silently producing a smaller list
 (`--allow-missing` to override).
 
+### IPv6
+
+The device answers DNS on IPv6 as well (its addresses are shown on the dashboard; on a LAN
+without an IPv6 prefix that's only a link-local `fe80::` address). On most home networks the
+router also hands out *itself* as an IPv6 DNS server through router advertisements, and
+clients that use it skip the ad-blocker. Two ways to deal with that:
+
+- **Best:** set the router's IPv6 DNS server to the device, or turn off the router's own
+  IPv6 DNS advertisement, if the router allows it. Per client, ignoring router-advertised DNS
+  works too (systemd-networkd: `[IPv6AcceptRA] UseDNS=no`).
+- **Partial:** tick *announce this device as IPv6 DNS server* on the dashboard. The device then
+  sends router advertisements carrying only a DNS server option (router lifetime 0, so it is
+  never used as a gateway). Clients add it next to the router's server, so many queries go to
+  the device, but not all of them.
+
 ### WiFi setup (no re-flash needed)
 
 If it can't connect (or you never set `secrets.h`), it starts an open access point
@@ -153,7 +168,9 @@ state-changing endpoint requires **HTTP Basic Auth** (user `WEB_USER`, password
 `WEB_PASS` from `secrets.h`, or the admin password set in the setup portal / dashboard,
 which takes precedence):
 
-- `/ban`, `/addblock`, `/unblock`, `/allow`, `/unallow`, `/forgetwifi`, `/setpass`, `/reboot`, `/setupstream`
+- `/ban`, `/addblock`, `/unblock`, `/allow`, `/unallow`, `/forgetwifi`, `/setpass`, `/reboot`, `/setupstream`, `/setra6`
+- `/debug.json` (read-only, but it lists recent queries and why each was blocked/allowed/cached,
+  which is browsing history)
 - `/upload`, `/update` (blocklist and firmware OTA)
 - `/setupdate`, `/fetchnow`
 
@@ -231,6 +248,7 @@ dig @<c3-ip> github.com        # -> real IP  (forwarded)
 - ✅ Allowlist (never-blocked domains) next to custom blocks
 - ✅ Primary + secondary upstream resolver, set on the dashboard, with automatic failover
 - ✅ Answer cache honouring TTLs (sized to the board: up to 128 entries in internal RAM, 1024 with PSRAM)
+- ✅ DNS over IPv6 too, with optional RDNSS announcements
 - ✅ Remote blocklist downloads verified (TLS against Mozilla roots + optional `.sha256`)
 - ⬜ Bucketed prefix index — ~18 flash reads/lookup → ~1–2 (issue #3), the throughput win
 - ⬜ Act as the DHCP server (hand itself out as DNS) for true plug-and-play

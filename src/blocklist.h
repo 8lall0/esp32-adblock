@@ -8,7 +8,9 @@ extern uint32_t numHashes;                 // entries in the flash list, 0 = non
 
 uint64_t fnv40(const char* s, size_t n);
 void openBlocklist();                      // at boot: open the flash list and build the index
-bool isBlocked(const char* domain);        // domain or a parent suffix blocked (allowlist wins)
+// Why a domain (or a parent suffix) is or isn't blocked; the allowlist wins over both lists.
+enum BlockWhy : uint8_t { BW_NONE, BW_ALLOW, BW_CUSTOM, BW_LIST };
+BlockWhy blockReason(const char* domain);
 
 // User-managed domain lists, persisted one domain per line. Small enough to scan linearly.
 static const int MAX_CUSTOM = 200;

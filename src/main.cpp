@@ -3,7 +3,8 @@
 // Dashboard at http://c3adblock.local : per-client stats, system info,
 // ban clients, custom block/allow domains. All control state persisted to flash.
 //
-//   dns.cpp        queries in, blocked answers, upstream forwarding + failover
+//   dns.cpp        queries in (IPv4 + IPv6), blocked answers, upstream forwarding + failover
+//   ipv6.cpp       IPv6 addresses, optional RDNSS announcements
 //   cache.cpp      TTL-aware answer cache
 //   blocklist.cpp  flash hash list, custom/allow lists, list replacement
 //   clients.cpp    per-client stats and bans
@@ -21,6 +22,7 @@
 #include "blocklist.h"
 #include "clients.h"
 #include "dns.h"
+#include "ipv6.h"
 #include "portal.h"
 #include "updates.h"
 #include "web.h"
@@ -47,6 +49,7 @@ void setup() {
 
   if (!connectWiFi()) startConfigPortal();   // portal blocks + reboots on save; returns only when connected
   Serial.printf("WiFi up: %s\n", WiFi.localIP().toString().c_str());
+  ipv6Begin();
   if (MDNS.begin("c3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c3adblock.local"); }
 
   if (defaultCreds())
@@ -67,5 +70,6 @@ void loop() {
   web.handleClient();
   bool busy = handleDns();
   updatesTick();                          // periodic remote blocklist auto-update
+  ipv6Tick();                             // IPv6 DNS announcements (if enabled)
   if (!busy) delay(1);   // sleep only when idle: full speed under load, cool when quiet
 }

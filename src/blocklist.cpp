@@ -87,8 +87,7 @@ static bool inList(const DomList& L, uint64_t h) { for (int i = 0; i < L.n; i++)
 // Only flash results are cached: the flash list only changes via reopenBlocklist(), which
 // rebuilds the index and clears the cache. Custom domains change at runtime, so they're
 // checked uncached (a short linear scan) to avoid serving stale answers.
-static bool isBlockedHash(uint64_t h) {
-  if (inList(customList, h)) return true;
+static bool isListedHash(uint64_t h) {
   uint32_t slot = h & (CACHE_SIZE - 1);
   if (cacheValid[slot]) {
     uint8_t want[HASH_BYTES]; packHash(h, want);
@@ -114,9 +113,10 @@ template <typename F> static bool anySuffix(const char* domain, F pred) {
   }
   return false;
 }
-bool isBlocked(const char* domain) {
-  if (allowList.n && anySuffix(domain, [](uint64_t h) { return inList(allowList, h); })) return false;
-  return anySuffix(domain, isBlockedHash);
+BlockWhy blockReason(const char* domain) {
+  if (allowList.n && anySuffix(domain, [](uint64_t h) { return inList(allowList, h); })) return BW_ALLOW;
+  if (customList.n && anySuffix(domain, [](uint64_t h) { return inList(customList, h); })) return BW_CUSTOM;
+  return anySuffix(domain, isListedHash) ? BW_LIST : BW_NONE;
 }
 
 // ---------- custom / allow lists ----------

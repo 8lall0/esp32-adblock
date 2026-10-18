@@ -1,5 +1,5 @@
 #pragma once
-// DNS front end: receives queries, answers blocked ones locally, serves cached answers and
+// DNS front end (IPv4 + IPv6): receives queries, answers blocked ones locally, serves cached answers and
 // forwards the rest to the upstream resolvers (with failover).
 #include <Arduino.h>
 
@@ -15,3 +15,4 @@ void loadUpstreams();
 void setUpstreams(uint32_t primary, uint32_t secondary);   // saves to flash
 void dnsBegin();                           // opens the sockets; call once WiFi is up
 bool handleDns();                          // drains queued packets; true if it did work
+String dnsDebugJson();                     // per-reason counters + the last queries and why
