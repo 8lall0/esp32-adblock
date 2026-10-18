@@ -15,4 +15,5 @@ void loadUpstreams();
 void setUpstreams(uint32_t primary, uint32_t secondary);   // saves to flash
 void dnsBegin();                           // opens the sockets; call once WiFi is up
 bool handleDns();                          // drains queued packets; true if it did work
+void dnsWait(uint32_t ms);                 // idle sleep that ends early when a packet arrives
 String dnsDebugJson();                     // per-reason counters + the last queries and why

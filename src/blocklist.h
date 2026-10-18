@@ -8,6 +8,8 @@ extern uint32_t numHashes;                 // entries in the flash list, 0 = non
 
 uint64_t fnv40(const char* s, size_t n);
 void openBlocklist();                      // at boot: open the flash list and build the index
+bool blocklistInMemory();                  // list copied to PSRAM (else lookups read flash)
+const char* blocklistMemState();           // why: "ok", "no psram", "no space", "read failed"
 // Why a domain (or a parent suffix) is or isn't blocked; the allowlist wins over both lists.
 enum BlockWhy : uint8_t { BW_NONE, BW_ALLOW, BW_CUSTOM, BW_LIST };
 BlockWhy blockReason(const char* domain);

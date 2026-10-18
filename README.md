@@ -250,6 +250,8 @@ dig @<c3-ip> github.com        # -> real IP  (forwarded)
 - ✅ Answer cache honouring TTLs (sized to the board: up to 128 entries in internal RAM, 2048 with PSRAM)
 - ✅ DNS over IPv6 too, with optional RDNSS announcements
 - ✅ DNS over TCP (port 53), so answers too big for UDP (long TXT records, DNSSEC) still resolve
+- ✅ Client names learned from the router's reverse DNS (DHCP hostnames), or set by hand on the dashboard
+- ✅ With PSRAM (e.g. ESP32-S3 super mini) the whole blocklist lives in RAM: ~50 µs per lookup instead of ~2 ms from flash
 - ✅ Remote blocklist downloads verified (TLS against Mozilla roots + optional `.sha256`)
 - ⬜ Bucketed prefix index — ~18 flash reads/lookup → ~1–2 (issue #3), the throughput win
 - ⬜ Act as the DHCP server (hand itself out as DNS) for true plug-and-play

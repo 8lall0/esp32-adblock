@@ -48,13 +48,14 @@ static void handleStats() {
              ",\"blocking\":" + (blockingOn ? "true" : "false") +
              ",\"up\":[\"" + IPAddress(upstream[0]).toString() + "\",\"" + (upstream[1] ? IPAddress(upstream[1]).toString() : String("")) + "\"]" +
              ",\"upActive\":" + upActive +
-             ",\"cacheHits\":" + cacheHits + ",\"cacheSlots\":" + cacheSlots +
+             ",\"cacheHits\":" + cacheHits + ",\"cacheSlots\":" + cacheSlots + ",\"listInRam\":" + (blocklistInMemory() ? "true" : "false") + ",\"listRam\":\"" + blocklistMemState() + "\"" +
              ",\"resumeIn\":" + (uint32_t)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0) +
              ",\"defcreds\":" + (defaultCreds() ? "true" : "false") +
              ",\"ip6\":" + ipv6AddrsJson() + ",\"ra6\":" + (raEnabled ? "true" : "false") +
              ",\"clients\":[";
   for (int i = 0; i < numClients; i++) { Dev& c = clients[i];
-    j += (i ? "," : ""); j += "{\"ip\":\"" + addrStr(c.addr) + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
+    j += (i ? "," : ""); j += "{\"ip\":\"" + addrStr(c.addr) + "\",\"name\":\"" + jesc(displayName(c)) + "\",\"manual\":" + (c.manualName ? "true" : "false") +
+         ",\"seen\":" + (millis() - c.lastSeen) / 1000 + ",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
   auto listJson = [&](const char* key, const DomList& L) {
     j += "],\""; j += key; j += "\":[";
     for (int i = 0; i < L.n; i++) { j += (i ? "," : ""); j += "\"" + jesc(L.dom[i]) + "\""; }
@@ -189,6 +190,12 @@ void webBegin() {
     }
     setUpstreams((uint32_t)a, ss.length() ? (uint32_t)b : 0);
     web.send(200, "text/plain", "ok");
+  });
+  web.on("/setname", []() {                 // /setname?ip=<client address>&name=Laptop  (empty name = automatic)
+    if (!requireAuth()) return;
+    Addr a; Dev* c = addrParse(web.arg("ip"), a) ? findClient(a) : nullptr;
+    if (!c) { web.send(404, "text/plain", "no such client"); return; }
+    setManualName(*c, web.arg("name")); web.send(200, "text/plain", "ok");
   });
   web.on("/setra6", []() {                  // /setra6?on=1 : announce the device as IPv6 DNS server
     if (!requireAuth()) return;

@@ -59,12 +59,75 @@ static void getMac(const Addr& a, uint8_t* mac) {
   for (struct netif* nif = netif_list; nif; nif = nif->next)
     if (etharp_find_addr(nif, &ipa, &eth, &ipret) >= 0 && eth) { memcpy(mac, eth->addr, 6); return; }
 }
-Dev* getClient(const Addr& a) {
-  for (int i = 0; i < numClients; i++) if (addrEq(clients[i].addr, a)) { clients[i].lastSeen = millis(); return &clients[i]; }
-  if (numClients < MAX_CLIENTS) {
-    Dev* c = &clients[numClients++];
-    c->addr = a; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = isBanned(a); c->label = "";
-    getMac(a, c->mac); return c;
+// ---------- names set by hand (persisted by MAC, or by address when there's no MAC) ----------
+static const char* NAMES_PATH = "/names.txt";
+static const int MAX_NAMES = 64;
+struct SavedName { String key, name; };
+static SavedName savedNames[MAX_NAMES]; static int numNames = 0;
+
+bool hasMac(const Dev& c) { for (int i = 0; i < 6; i++) if (c.mac[i]) return true; return false; }
+static String macKey(const uint8_t* m) { char s[18]; snprintf(s, sizeof(s), "%02x:%02x:%02x:%02x:%02x:%02x", m[0],m[1],m[2],m[3],m[4],m[5]); return String(s); }
+static String nameKey(const Dev& c) { return hasMac(c) ? macKey(c.mac) : addrStr(c.addr); }
+void loadNames() {
+  numNames = 0; if (!LittleFS.exists(NAMES_PATH)) return;
+  File f = LittleFS.open(NAMES_PATH, "r"); if (!f) return;
+  while (f.available() && numNames < MAX_NAMES) {
+    String l = f.readStringUntil('\n'); l.trim();
+    int sp = l.indexOf(' '); if (sp <= 0) continue;
+    savedNames[numNames].key = l.substring(0, sp); savedNames[numNames].name = l.substring(sp + 1); numNames++;
   }
+  f.close();
+}
+static void saveNames() {
+  File f = LittleFS.open(NAMES_PATH, "w"); if (!f) return;
+  for (int i = 0; i < numNames; i++) { f.print(savedNames[i].key); f.print(' '); f.println(savedNames[i].name); }
+  f.close();
+}
+static void applySavedName(Dev& c) {
+  const String k = nameKey(c);
+  for (int i = 0; i < numNames; i++) if (savedNames[i].key == k) { c.name = savedNames[i].name; c.manualName = true; return; }
+}
+void setManualName(Dev& c, String name) {
+  name.trim(); if (name.length() > 31) name = name.substring(0, 31);
+  const String k = nameKey(c);
+  int at = -1; for (int i = 0; i < numNames; i++) if (savedNames[i].key == k) at = i;
+  if (name.length()) {
+    if (at < 0 && numNames < MAX_NAMES) at = numNames++;
+    if (at >= 0) { savedNames[at].key = k; savedNames[at].name = name; }
+  } else if (at >= 0) {
+    savedNames[at] = savedNames[--numNames];
+  }
+  saveNames();
+  for (int i = 0; i < numClients; i++) {           // every entry of that machine (IPv4 + IPv6)
+    Dev& d = clients[i];
+    if (nameKey(d) != k) continue;
+    if (name.length()) { d.name = name; d.manualName = true; }
+    else { d.name = ""; d.manualName = false; d.nameState = 0; }   // ask the router again
+  }
+}
+String displayName(const Dev& c) {
+  if (c.name.length() || !hasMac(c)) return c.name;
+  for (int i = 0; i < numClients; i++)
+    if (&clients[i] != &c && clients[i].name.length() && !memcmp(clients[i].mac, c.mac, 6)) return clients[i].name;
+  return "";
+}
+
+Dev* findClient(const Addr& a) {
+  for (int i = 0; i < numClients; i++) if (addrEq(clients[i].addr, a)) return &clients[i];
   return nullptr;
+}
+Dev* getClient(const Addr& a) {
+  if (Dev* c = findClient(a)) { c->lastSeen = millis(); return c; }
+  Dev* c = nullptr;
+  if (numClients < MAX_CLIENTS) c = &clients[numClients++];
+  else {                                           // full: reuse the longest-idle entry that isn't banned
+    const uint32_t now = millis(); uint32_t idle = 0;
+    for (int i = 0; i < numClients; i++)
+      if (!clients[i].banned && now - clients[i].lastSeen >= idle) { idle = now - clients[i].lastSeen; c = &clients[i]; }
+    if (!c) return nullptr;
+  }
+  *c = Dev();
+  c->addr = a; c->lastSeen = millis(); c->banned = isBanned(a);
+  getMac(a, c->mac); applySavedName(*c);
+  return c;
 }

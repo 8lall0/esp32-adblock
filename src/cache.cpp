@@ -1,7 +1,8 @@
 #include "cache.h"
 
 // Upstream answers are kept for their TTL (capped) so repeat lookups skip the round trip.
-// Sized at boot to the hardware: with PSRAM in the heap, CACHE_SLOTS_PSRAM entries there;
+// Sized at boot to the hardware: with PSRAM, up to CACHE_SLOTS_PSRAM entries in what's left
+// of it (the blocklist copy is allocated first);
 // otherwise up to a quarter of the free internal heap (16..128 entries, ~0.5 KB each), which
 // leaves room for the TLS handshake of remote blocklist updates. 2-way set associative.
 // Only answers that fit in 512 bytes are kept: every client accepts that size.
@@ -13,9 +14,12 @@ static CacheEntry* ansCache = nullptr; int cacheSlots = 0;
 uint32_t cacheHits = 0;
 
 void initAnswerCache() {
-  if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > CACHE_SLOTS_PSRAM * sizeof(CacheEntry)) {
-    ansCache = (CacheEntry*)heap_caps_calloc(CACHE_SLOTS_PSRAM, sizeof(CacheEntry), MALLOC_CAP_SPIRAM);
-    if (ansCache) cacheSlots = CACHE_SLOTS_PSRAM;
+  const size_t ps = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  if (ps > 64 * 1024) {
+    int n = CACHE_SLOTS_PSRAM;
+    while (n > CACHE_SLOTS_MAX && n * sizeof(CacheEntry) > ps - 64 * 1024) n /= 2;
+    if (n > CACHE_SLOTS_MAX) ansCache = (CacheEntry*)heap_caps_calloc(n, sizeof(CacheEntry), MALLOC_CAP_SPIRAM);
+    if (ansCache) cacheSlots = n;
   }
   if (!ansCache) {
     int n = CACHE_SLOTS_MAX;
@@ -23,7 +27,7 @@ void initAnswerCache() {
     ansCache = (CacheEntry*)calloc(n, sizeof(CacheEntry));
     cacheSlots = ansCache ? n : 0;
   }
-  Serial.printf("answer cache: %d entries (%s)\n", cacheSlots, cacheSlots == CACHE_SLOTS_PSRAM ? "PSRAM" : "internal RAM");
+  Serial.printf("answer cache: %d entries (%s)\n", cacheSlots, cacheSlots > CACHE_SLOTS_MAX ? "PSRAM" : "internal RAM");
 }
 // Key = lowercased question + EDNS presence, DO, AD and CD bits (answers differ with DNSSEC).
 uint64_t answerKey(const uint8_t* msg, int qlen, int qend) {

@@ -106,6 +106,7 @@ enum Why : uint8_t { W_UPSTREAM, W_CACHE, W_ALLOW, W_PAUSED, W_NOLIST, W_UNPARSE
 struct Decision { uint32_t t; Addr client; char domain[64]; uint16_t qtype; Why why; bool tcp; };
 static Decision decisions[DECISION_LOG]; static int decisionNext = 0, decisionCount = 0;
 static uint32_t whyCount[W_COUNT];
+static uint32_t lookupN = 0, lookupMaxUs = 0; static uint64_t lookupSumUs = 0;   // blockReason() timing
 static void recordDecision(const Addr& client, const char* domain, uint16_t qtype, Why why, bool tcp) {
   whyCount[why]++;
   Decision& d = decisions[decisionNext];
@@ -168,12 +169,74 @@ static void forwardUpstream(const Addr& client, uint16_t cport, int qlen, int qe
   sendUpstream(upstream[upActive], qlen);
   p->sentMask = 1 << upActive;
 }
+// ---------- client names from the router's reverse DNS ----------
+// Home routers answer PTR queries for LAN addresses with the DHCP hostname ("laptop.home").
+// One query per new IPv4 client, sent to the gateway from upstreamSock; retried every
+// NAME_RETRY_MS while there's no name. IPv6 entries borrow the name of the same MAC.
+static const int MAX_NAME_REQS = 8;
+static const uint32_t NAME_TIMEOUT_MS = 3000, NAME_RETRY_MS = 30UL * 60 * 1000;
+struct NameReq { bool used; uint16_t txid; uint32_t ip; uint32_t t; };
+static NameReq nameReqs[MAX_NAME_REQS];
+static void requestName(Dev& c) {
+  const uint32_t gw = (uint32_t)WiFi.gatewayIP(); if (!gw) return;
+  NameReq* r = nullptr;
+  for (int i = 0; i < MAX_NAME_REQS; i++) if (!nameReqs[i].used || millis() - nameReqs[i].t > NAME_TIMEOUT_MS) { r = &nameReqs[i]; break; }
+  if (!r) return;                                  // busy: asked again on a later query
+  uint8_t q[64]; int n = 12;
+  r->used = true; r->txid = (uint16_t)esp_random(); memcpy(&r->ip, c.addr.b, 4); r->t = millis();
+  memset(q, 0, 12); q[0] = r->txid >> 8; q[1] = r->txid; q[2] = 0x01; q[5] = 1;   // RD, 1 question
+  for (int i = 3; i >= 0; i--) { char lab[4]; int l = snprintf(lab, sizeof(lab), "%u", c.addr.b[i]); q[n++] = l; memcpy(q + n, lab, l); n += l; }
+  const char* tail[] = { "in-addr", "arpa" };
+  for (const char* t : tail) { int l = strlen(t); q[n++] = l; memcpy(q + n, t, l); n += l; }
+  q[n++] = 0; q[n++] = 0; q[n++] = 12; q[n++] = 0; q[n++] = 1;               // PTR, IN
+  upstreamSock.writeTo(q, n, IPAddress(gw), 53);
+  c.nameState = 1; c.nameAt = millis();
+}
+// Reads a (possibly compressed) DNS name at pos; keeps only its first label (the host name).
+static String firstLabel(const uint8_t* m, int n, int pos) {
+  for (int hops = 0; hops < 8 && pos < n; hops++) {
+    uint8_t l = m[pos];
+    if ((l & 0xC0) == 0xC0) { if (pos + 1 >= n) return ""; pos = ((l & 0x3F) << 8) | m[pos + 1]; continue; }
+    if (!l || pos + 1 + l > n) return "";
+    String s; for (int i = 0; i < l && i < 31; i++) { char ch = m[pos + 1 + i]; if (isalnum(ch) || ch == '-' || ch == '_') s += ch; }
+    return s;
+  }
+  return "";
+}
+static bool handleNameReply(int n) {
+  const uint16_t id = (buf[0] << 8) | buf[1];
+  NameReq* r = nullptr;
+  for (int i = 0; i < MAX_NAME_REQS; i++) if (nameReqs[i].used && nameReqs[i].txid == id) r = &nameReqs[i];
+  if (!r) return false;
+  r->used = false;
+  Dev* c = findClient(addrV4(r->ip));
+  if (!c) return true;
+  c->nameState = 2; c->nameAt = millis();
+  const int an = (buf[6] << 8) | buf[7];
+  int pos = 12;
+  while (pos < n && buf[pos]) pos += ((buf[pos] & 0xC0) == 0xC0) ? 1 : buf[pos] + 1;   // question name
+  pos += ((pos < n && (buf[pos] & 0xC0) == 0xC0) ? 2 : 1) + 4;
+  for (int a = 0; a < an && pos + 10 < n; a++) {
+    while (pos < n && buf[pos] && (buf[pos] & 0xC0) != 0xC0) pos += buf[pos] + 1;  // owner name
+    pos += (pos < n && (buf[pos] & 0xC0) == 0xC0) ? 2 : 1;
+    if (pos + 10 > n) break;
+    const uint16_t type = (buf[pos] << 8) | buf[pos + 1], rdlen = (buf[pos + 8] << 8) | buf[pos + 9];
+    if (type == 12) { String nm = firstLabel(buf, n, pos + 10); if (nm.length() && !c->manualName) c->name = nm; break; }
+    pos += 10 + rdlen;
+  }
+  return true;
+}
+static void maybeRequestName(Dev* c) {
+  if (!c || c->addr.v6 || c->manualName || c->nameState == 1) return;
+  if (c->nameState == 0 || (!c->name.length() && millis() - c->nameAt > NAME_RETRY_MS)) requestName(*c);
+}
+
 static void handleReply(const Addr& from, uint16_t port, int n) {
   uint32_t ip; memcpy(&ip, from.b, 4);
+  if (port != UPSTREAM_PORT) return;
   int u = upstreamIndex(ip);
-  if (u < 0 || port != UPSTREAM_PORT) return;
   const uint16_t wid = (buf[0] << 8) | buf[1];
-  for (int i = 0; i < MAX_PENDING; i++) {
+  for (int i = 0; u >= 0 && i < MAX_PENDING; i++) {
     Pending& p = pending[i];
     if (!p.used || p.wid != wid || !(p.sentMask & (1 << u))) continue;
     if (p.ql && (n < 12 + p.ql || memcmp(buf + 12, p.pkt + 12, p.ql) != 0)) return;
@@ -183,6 +246,7 @@ static void handleReply(const Addr& from, uint16_t port, int n) {
     sendClient(p.client, p.cport, n);
     return;
   }
+  if (ip == (uint32_t)WiFi.gatewayIP()) handleNameReply(n);   // reverse-DNS answer for a client name
 }
 // Retries, failover and expiry for in-flight queries.
 static void servicePending() {
@@ -229,12 +293,14 @@ static int answerLocally(const Addr& client, int qlen, bool tcp, int* qendOut, u
   char domain[256] = ""; uint16_t qtype = 0; int qend = 0;   // qend stays 0 if the question can't be parsed
   size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
   Dev* c = getClient(client);
+  maybeRequestName(c);
   Why why;
   if (c && c->banned)  why = W_BANNED;
   else if (!dl)        why = W_UNPARSED;
   else if (!blockingOn) why = W_PAUSED;
   else if (!numHashes) why = W_NOLIST;               // list being replaced: fail open
-  else switch (blockReason(domain)) {
+  else switch ([&] { uint32_t t0 = micros(); BlockWhy r = blockReason(domain); uint32_t dt = micros() - t0;
+                      lookupN++; lookupSumUs += dt; if (dt > lookupMaxUs) lookupMaxUs = dt; return r; }()) {
     case BW_LIST:   why = W_LIST; break;
     case BW_CUSTOM: why = W_CUSTOM; break;
     case BW_ALLOW:  why = W_ALLOW; break;
@@ -349,7 +415,7 @@ static void tcpService(TcpConn& c) {
     case T_CONNECT: {
       fd_set w; FD_ZERO(&w); FD_SET(c.ufd, &w); struct timeval tv = { 0, 0 };
       if (select(c.ufd + 1, nullptr, &w, nullptr, &tv) <= 0) {
-        if (now - c.t > 3000) tcpUpFailed(c);      // connect timeout
+        if (now - c.t > 1000) tcpUpFailed(c);      // connect timeout: on to the other upstream
         return;
       }
       int err = 0; socklen_t el = sizeof(err);
@@ -436,6 +502,9 @@ void dnsBegin() {
   tcpBegin();
 }
 // Drain a burst per call (capped, so web/OTA still get a turn). Returns true if it did work.
+// Called by loop() when idle: sleeps up to ms but wakes as soon as a packet is queued
+// (delay(1) added up to a millisecond to every query that arrived while idle).
+void dnsWait(uint32_t ms) { Pkt* k; xQueuePeek(pktQ, &k, pdMS_TO_TICKS(ms)); }
 bool handleDns() {
   bool did = false; Pkt* k;
   for (int budget = 0; budget < 32 && xQueueReceive(pktQ, &k, 0) == pdTRUE; budget++) {
@@ -454,7 +523,15 @@ bool handleDns() {
 String dnsDebugJson() {
   String j = "{\"counts\":{";
   for (int i = 0; i < W_COUNT; i++) { j += (i ? ",\"" : "\""); j += WHY_NAMES[i]; j += "\":"; j += whyCount[i]; }
-  j += "},\"blocking\":"; j += blockingOn ? "true" : "false";
+  j += "},\"lookup\":{\"n\":"; j += lookupN; j += ",\"avgUs\":"; j += lookupN ? (uint32_t)(lookupSumUs / lookupN) : 0;
+  j += ",\"maxUs\":"; j += lookupMaxUs; j += "}";
+  j += ",\"psram\":{\"total\":"; j += heap_caps_get_total_size(MALLOC_CAP_SPIRAM); j += ",\"free\":"; j += heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  j += ",\"largest\":"; j += heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM); j += "}";
+  static const char* const RESET[] = { "unknown", "power-on", "external pin", "software", "panic (crash)", "interrupt watchdog",
+                                       "task watchdog", "other watchdog", "deep sleep", "brownout", "SDIO", "USB", "JTAG" };
+  const int rr = (int)esp_reset_reason();
+  j += ",\"resetReason\":\""; j += (rr >= 0 && rr < (int)(sizeof(RESET) / sizeof(*RESET))) ? RESET[rr] : "?"; j += "\"";
+  j += ",\"blocking\":"; j += blockingOn ? "true" : "false";
   j += ",\"recent\":[";
   const uint32_t now = millis();
   for (int i = 0; i < decisionCount; i++) {          // newest first

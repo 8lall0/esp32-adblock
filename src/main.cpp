@@ -32,7 +32,7 @@ void setup() {
   Serial.println("\n[c3-adblock] booting");
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
   openBlocklist();
-  loadList(customList); loadList(allowList); loadBanned(); loadUpdateCfg(); loadAuth(); loadUpstreams();
+  loadList(customList); loadList(allowList); loadBanned(); loadNames(); loadUpdateCfg(); loadAuth(); loadUpstreams();
   Serial.printf("custom: %d, allowed: %d, banned: %d\n", customList.n, allowList.n, numBanned);
 
   // Hold BOOT at power-on to wipe saved WiFi + admin password and force the setup portal
@@ -71,5 +71,5 @@ void loop() {
   bool busy = handleDns();
   updatesTick();                          // periodic remote blocklist auto-update
   ipv6Tick();                             // IPv6 DNS announcements (if enabled)
-  if (!busy) delay(1);   // sleep only when idle: full speed under load, cool when quiet
+  if (!busy) dnsWait(1);   // sleep only when idle (woken by DNS packets): full speed under load, cool when quiet
 }

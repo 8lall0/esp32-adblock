@@ -27,7 +27,7 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 <select id=pausedur style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;padding:5px"><option value=30>30s</option><option value=300 selected>5 min</option><option value=1800>30 min</option><option value=0>until I re-enable</option></select>
 <button id=pausebtn onclick=togglePause()>Pause</button></div>
 <div class=cards id=sys></div>
-<h2>CLIENTS</h2><table id=ct><thead><tr><th>Client</th><th>MAC</th><th>Blocked</th><th>Allowed</th><th></th></tr></thead><tbody></tbody></table>
+<h2>CLIENTS</h2><table id=ct><thead><tr><th>Name</th><th>Address</th><th>MAC</th><th>Blocked</th><th>Allowed</th><th>Seen</th><th></th></tr></thead><tbody></tbody></table>
 <h2>CUSTOM BLOCKED DOMAINS</h2>
 <div style=margin-bottom:8px><input id=dom placeholder="ads.example.com" size=30><button onclick=addDom()>Block domain</button></div>
 <table id=cl><tbody></tbody></table>
@@ -61,6 +61,7 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 <button onclick="if(confirm('Forget saved WiFi and reboot into the setup portal?'))forgetWifi()">Forget WiFi</button> <span id=rbmsg style=color:#8b949e></span></div>
 </div><script>
 function fmt(n){return n.toLocaleString()}
+function ago(s){return s<60?s+'s':s<3600?Math.floor(s/60)+'m':s<86400?Math.floor(s/3600)+'h':Math.floor(s/86400)+'d'}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 // A plain <img>/<form> CSRF can't set a custom header, only same-origin fetch()
 // can — so requiring this on every mutating request blocks drive-by CSRF even
@@ -80,9 +81,10 @@ sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allow
 ['Clients',s.clients.length,''],['WiFi',s.rssi+' dBm',''],['Temp',s.temp+' °C',''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,'']]
 .map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
 ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
-`<tr><td>${c.ip}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
-<td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
-<td><button class=ban data-ip="${c.ip}">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
+`<tr><td>${esc(c.name||'')}${c.manual?' <span class=tag>set</span>':''} <button class=ren data-ip="${esc(c.ip)}" data-n="${esc(c.name||'')}" title=rename>&#9998;</button>${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td>
+<td>${esc(c.ip)}</td><td>${c.mac}</td>
+<td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td><td>${ago(c.seen)}</td>
+<td><button class=ban data-ip="${esc(c.ip)}">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
 const rows=l=>l.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button class=rmbtn data-d="${esc(d)}">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
 cl.tBodies[0].innerHTML=rows(s.custom);al.tBodies[0].innerHTML=rows(s.allow||[]);
 if(document.activeElement!=uurl)uurl.value=s.upurl||'';
@@ -91,7 +93,10 @@ ustat.textContent=s.upstat||'—';
 ip6.textContent=(s.ip6||[]).join('  ')||'no IPv6 address yet';if(document.activeElement!=ra6)ra6.checked=!!s.ra6;
 if(s.up){if(document.activeElement!=up0)up0.value=s.up[0];if(document.activeElement!=up1)up1.value=s.up[1];upact.textContent=s.up[s.upActive]||'—';}}
 function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(()=>{dom.value='';load()})}}
-ct.addEventListener('click',e=>{if(e.target.classList.contains('ban'))fetch('/ban?ip='+e.target.dataset.ip,{headers:CSRF_HDRS}).then(load)});
+ct.addEventListener('click',e=>{let t=e.target;
+if(t.classList.contains('ban'))fetch('/ban?ip='+encodeURIComponent(t.dataset.ip),{headers:CSRF_HDRS}).then(load);
+if(t.classList.contains('ren')){let n=prompt('Name for '+t.dataset.ip+' (empty = automatic from the router):',t.dataset.n);
+if(n!==null)fetch('/setname?ip='+encodeURIComponent(t.dataset.ip)+'&name='+encodeURIComponent(n.trim()),{headers:CSRF_HDRS}).then(load)}});
 cl.addEventListener('click',e=>{if(e.target.classList.contains('rmbtn'))fetch('/unblock?d='+encodeURIComponent(e.target.dataset.d),{headers:CSRF_HDRS}).then(load)});
 function allowDom(){let d=adom.value.trim();if(d){fetch('/allow?d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(()=>{adom.value='';load()})}}
 al.addEventListener('click',e=>{if(e.target.classList.contains('rmbtn'))fetch('/unallow?d='+encodeURIComponent(e.target.dataset.d),{headers:CSRF_HDRS}).then(load)});
