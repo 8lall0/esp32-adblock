@@ -363,25 +363,52 @@ static void handleBan() {
 }
 
 // ---------- blocklist swap (shared by upload + remote fetch) ----------
-// The partition holds one list, so we free the old one before writing the new.
-// While swapping, numHashes=0 -> device fail-opens (forwards, no blocking).
+// The new list is written to /blocklist.new next to the live one whenever both fit, so a
+// failed or truncated transfer leaves the old list serving. Only when the partition can't
+// hold two lists do we free the old one first; while that swap runs numHashes=0 and the
+// device fail-opens (forwards, no blocking).
+static const char* BLOCKLIST_NEW = "/blocklist.new";
 static void reopenBlocklist() {
+  if (blocklist) blocklist.close();
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   numHashes = blocklist ? blocklist.size() / HASH_BYTES : 0;
   buildFlashIndex();
 }
-static void beginBlocklistSwap() {
+// expectBytes: incoming size if known (0 = unknown). Returns true if the old list was kept.
+static bool beginBlocklistSwap(size_t expectBytes) {
+  LittleFS.remove(BLOCKLIST_NEW);
+  size_t freeB = LittleFS.totalBytes() - LittleFS.usedBytes();
+  if (expectBytes && expectBytes + 32768 <= freeB) return true;   // margin for fs metadata
   if (blocklist) blocklist.close();
   numHashes = 0;
   LittleFS.remove(BLOCKLIST_PATH);
-  LittleFS.remove("/blocklist.new");
+  return false;
 }
-static bool commitNewBlocklist() {                  // /blocklist.new -> live (validated)
-  File f = LittleFS.open("/blocklist.new", "r");
-  size_t sz = f ? f.size() : 0; if (f) f.close();
-  bool ok = sz > 0 && (sz % HASH_BYTES) == 0;       // sorted hash blob -> 5-byte multiple
-  if (ok) LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
-  else    LittleFS.remove("/blocklist.new");
+// A real blocklist.bin is a non-empty run of strictly ascending 5-byte hashes. Checking the
+// order rejects HTML error pages, wrong files and corrupted transfers, not just bad sizes.
+static bool validBlocklist(const char* path) {
+  File f = LittleFS.open(path, "r"); if (!f) return false;
+  size_t sz = f.size();
+  bool ok = sz > 0 && (sz % HASH_BYTES) == 0;
+  uint64_t prev = 0; bool first = true;
+  while (ok && f.available()) {
+    int n = f.read(rangeBuf, sizeof(rangeBuf));    // reuses the lookup buffer (multiple of 5)
+    if (n <= 0 || n % HASH_BYTES) { ok = false; break; }
+    for (int i = 0; i < n; i += HASH_BYTES) {
+      uint64_t v = unpackHash(rangeBuf + i);
+      if (!first && v <= prev) { ok = false; break; }
+      prev = v; first = false;
+    }
+  }
+  f.close();
+  return ok;
+}
+static bool commitNewBlocklist(bool complete) {     // /blocklist.new -> live (validated)
+  if (blocklist) blocklist.close();                 // rangeBuf is shared with lookups
+  numHashes = 0;
+  bool ok = complete && validBlocklist(BLOCKLIST_NEW);
+  if (ok) { LittleFS.remove(BLOCKLIST_PATH); ok = LittleFS.rename(BLOCKLIST_NEW, BLOCKLIST_PATH); }
+  if (!ok) LittleFS.remove(BLOCKLIST_NEW);
   reopenBlocklist();
   return ok;
 }
@@ -393,7 +420,7 @@ static File upFile;
 static void handleUploadDone() {
   if (!upAuthOk) { web.requestAuthentication(); return; }
   web.send(upOk ? 200 : 500, "text/plain",
-           upOk ? "ok" : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
+           upOk ? "ok" : "rejected: not a valid blocklist.bin (empty, wrong size or unsorted)");
 }
 static void handleUpload() {
   HTTPUpload& u = web.upload();
@@ -401,8 +428,9 @@ static void handleUpload() {
     case UPLOAD_FILE_START:
       upAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
       if (!upAuthOk) { Serial.println("[ota] blocklist upload: auth/CSRF check failed"); break; }
-      upOk = false; beginBlocklistSwap();
-      upFile = LittleFS.open("/blocklist.new", "w");
+      upOk = false;
+      beginBlocklistSwap(web.clientContentLength() > 0 ? web.clientContentLength() : 0);
+      upFile = LittleFS.open(BLOCKLIST_NEW, "w");
       Serial.printf("[ota] receiving %s\n", u.filename.c_str());
       break;
     case UPLOAD_FILE_WRITE:
@@ -411,13 +439,13 @@ static void handleUpload() {
     case UPLOAD_FILE_END:
       if (!upAuthOk) break;
       if (upFile) upFile.close();
-      upOk = commitNewBlocklist();
+      upOk = commitNewBlocklist(true);
       Serial.printf("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", numHashes);
       break;
     case UPLOAD_FILE_ABORTED:
       if (!upAuthOk) break;
       if (upFile) upFile.close();
-      LittleFS.remove("/blocklist.new"); reopenBlocklist();
+      LittleFS.remove(BLOCKLIST_NEW); reopenBlocklist();
       Serial.println("[ota] aborted");
       break;
   }
@@ -445,19 +473,27 @@ static bool fetchBlocklist(String url) {
   if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "begin failed"; return false; }
   int code = http.GET();
   if (code != HTTP_CODE_OK) { http.end(); updateStatus = "HTTP " + String(code); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
-  beginBlocklistSwap();
-  File f = LittleFS.open("/blocklist.new", "w");
+  int len = http.getSize();
+  beginBlocklistSwap(len > 0 ? len : 0);
+  File f = LittleFS.open(BLOCKLIST_NEW, "w");
   if (!f) { http.end(); updateStatus = "fs open failed"; reopenBlocklist(); return false; }
   WiFiClient* stream = http.getStreamPtr();
-  int len = http.getSize(); uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
+  uint8_t b[1024]; size_t total = 0; uint32_t idle = millis(); bool wrOk = true;
   while (http.connected() && (len < 0 || (int)total < len)) {
     size_t avail = stream->available();
-    if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { f.write(b, n); total += n; idle = millis(); } }
+    if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { wrOk &= f.write(b, n) == (size_t)n; total += n; idle = millis(); } }
     else { if (millis() - idle > 15000) break; delay(2); }
   }
   f.close(); http.end();
-  bool ok = commitNewBlocklist();
-  updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("bad data (" + String(total) + "B)");
+  // A dropped connection used to commit whatever had arrived if it happened to be a
+  // multiple of 5 bytes. Require the full Content-Length (when the server sent one).
+  bool complete = wrOk && (len < 0 || total == (size_t)len);
+  bool ok = commitNewBlocklist(complete);
+  if (ok)             updateStatus = "ok: " + String(numHashes) + " domains";
+  else if (!wrOk)     updateStatus = "flash full / write failed (" + String(total) + "B)";
+  else if (!complete) updateStatus = "incomplete download (" + String(total) + "/" + String(len) + "B)";
+  else                updateStatus = "bad data (" + String(total) + "B)";
+  if (!ok && numHashes) updateStatus += ", kept old list";
   Serial.printf("[remote] %s\n", updateStatus.c_str());
   return ok;
 }
