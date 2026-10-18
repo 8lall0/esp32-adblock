@@ -22,13 +22,18 @@
                        // have been provisioned via the captive portal (copy secrets.example.h)
 
 // ---- config ----
+// Default upstream resolvers; both can be changed on the dashboard (saved to /upstream.cfg).
 #ifndef UPSTREAM_IP
 #define UPSTREAM_IP 9, 9, 9, 9                    // Quad9
+#endif
+#ifndef UPSTREAM2_IP
+#define UPSTREAM2_IP 149, 112, 112, 112           // Quad9 secondary (same operator, same policy)
 #endif
 #ifndef UPSTREAM_PORT
 #define UPSTREAM_PORT 53
 #endif
-static const IPAddress UPSTREAM(UPSTREAM_IP);
+static const char* UPSTREAM_CFG = "/upstream.cfg";
+uint32_t upstream[2] = { (uint32_t)IPAddress(UPSTREAM_IP), (uint32_t)IPAddress(UPSTREAM2_IP) };  // [1] = 0: none
 static const uint16_t DNS_PORT = 53;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
 static const int HASH_BYTES = 5;
@@ -277,14 +282,32 @@ static void sendTo(AsyncUDP& sock, uint32_t ip, uint16_t port, int len) { sock.w
 // Upstream forwarding is asynchronous: a query is sent with a fresh random txid and parked
 // in this table, and replies are matched back to their client whenever they arrive. The old
 // code waited up to 1 s per query, so one slow lookup stalled every other client, the
-// dashboard and OTA. A reply is only accepted if its source address/port, txid and question
-// section match a pending query (issue #10: late replies must never reach the wrong client);
-// the client's own txid is restored on the way back.
+// dashboard and OTA. A reply is only accepted if its source is an upstream the query was sent
+// to and its txid and question section match (issue #10: late replies must never reach the
+// wrong client); the client's own txid is restored on the way back.
+//
+// Failover: a query unanswered after RETRY_MS is re-sent (same txid) to the other upstream and
+// whichever answers first wins. FAILOVER_AFTER consecutive misses switch the active upstream;
+// the primary is probed again every PRIMARY_RETRY_MS.
 static const int MAX_PENDING = 32;
 static const uint32_t PENDING_TIMEOUT_MS = 2000;   // clients retry on their own after this
-struct Pending { bool used; uint16_t wid, cport; uint8_t cid0, cid1; uint32_t cip, t0; uint16_t ql; uint8_t q[256]; };
+static const uint32_t RETRY_MS = 700;
+static const uint8_t  FAILOVER_AFTER = 3;
+static const uint32_t PRIMARY_RETRY_MS = 60000;
+struct Pending {
+  bool used; uint8_t sentMask;                     // bit i: sent to upstream[i]
+  uint16_t wid, cport, plen, ql; uint8_t cid0, cid1; uint32_t cip, t0;
+  uint8_t pkt[300];                                // whole query (for the retry); ql = question bytes after the header
+};
 static Pending pending[MAX_PENDING];
+int upActive = 0; uint8_t upMisses[2] = { 0, 0 }; uint32_t upSwitchedAt = 0;
 
+static int upstreamIndex(uint32_t ip) { for (int i = 0; i < 2; i++) if (upstream[i] && upstream[i] == ip) return i; return -1; }
+static void sendPending(Pending& p, int u) {
+  memcpy(buf, p.pkt, p.plen);
+  sendTo(upstreamSock, upstream[u], UPSTREAM_PORT, p.plen);
+  p.sentMask |= 1 << u;
+}
 static void forwardUpstream(uint32_t cip, uint16_t cport, int qlen, int qend) {
   Pending* p = nullptr;
   for (int i = 0; i < MAX_PENDING; i++) {          // free slot, else evict the oldest
@@ -296,24 +319,66 @@ static void forwardUpstream(uint32_t cip, uint16_t cport, int qlen, int qend) {
     wid = (uint16_t)esp_random(); clash = false;
     for (int i = 0; i < MAX_PENDING; i++) if (pending[i].used && &pending[i] != p && pending[i].wid == wid) clash = true;
   } while (clash);
-  int ql = qend - 12;
-  p->ql = (ql > 0 && ql <= (int)sizeof(p->q) && qend <= qlen) ? ql : 0;
-  if (p->ql) memcpy(p->q, buf + 12, p->ql);
-  p->used = true; p->wid = wid; p->cip = cip; p->cport = cport; p->cid0 = buf[0]; p->cid1 = buf[1]; p->t0 = millis();
+  p->used = true; p->sentMask = 0; p->wid = wid; p->cip = cip; p->cport = cport;
+  p->cid0 = buf[0]; p->cid1 = buf[1]; p->t0 = millis();
   buf[0] = wid >> 8; buf[1] = wid & 0xFF;
-  sendTo(upstreamSock, (uint32_t)UPSTREAM, UPSTREAM_PORT, qlen);
+  const bool fits = qlen <= (int)sizeof(p->pkt);
+  p->plen = fits ? qlen : 0;                       // too big to keep: no retry, no question check
+  p->ql = (fits && qend > 12 && qend <= qlen) ? qend - 12 : 0;
+  if (fits) memcpy(p->pkt, buf, qlen);
+  sendTo(upstreamSock, upstream[upActive], UPSTREAM_PORT, qlen);
+  p->sentMask = 1 << upActive;
 }
 static void handleReply(uint32_t ip, uint16_t port, int n) {
-  if (ip != (uint32_t)UPSTREAM || port != UPSTREAM_PORT) return;
+  int u = upstreamIndex(ip);
+  if (u < 0 || port != UPSTREAM_PORT) return;
   const uint16_t wid = (buf[0] << 8) | buf[1];
   for (int i = 0; i < MAX_PENDING; i++) {
     Pending& p = pending[i];
-    if (!p.used || p.wid != wid) continue;
-    if (p.ql && (n < 12 + p.ql || memcmp(buf + 12, p.q, p.ql) != 0)) return;
+    if (!p.used || p.wid != wid || !(p.sentMask & (1 << u))) continue;
+    if (p.ql && (n < 12 + p.ql || memcmp(buf + 12, p.pkt + 12, p.ql) != 0)) return;
     buf[0] = p.cid0; buf[1] = p.cid1; p.used = false;
+    upMisses[u] = 0;
     sendTo(dnsSock, p.cip, p.cport, n);
     return;
   }
+}
+// Retries, failover and expiry for in-flight queries.
+static void servicePending() {
+  const uint32_t now = millis();
+  const bool two = upstream[1] != 0;
+  for (int i = 0; i < MAX_PENDING; i++) {
+    Pending& p = pending[i];
+    if (!p.used) continue;
+    const uint32_t age = now - p.t0;
+    if (age > PENDING_TIMEOUT_MS) { p.used = false; continue; }
+    if (age > RETRY_MS && p.sentMask != 3 && p.plen) {
+      const int first = (p.sentMask & 1) ? 0 : 1;
+      if (upMisses[first] < 255) upMisses[first]++;
+      if (two) sendPending(p, 1 - first); else p.sentMask = 3;   // single upstream: count once
+    }
+  }
+  if (two && upMisses[upActive] >= FAILOVER_AFTER) {
+    Serial.printf("[dns] upstream %s not answering, switching\n", IPAddress(upstream[upActive]).toString().c_str());
+    upActive = 1 - upActive; upMisses[upActive] = 0; upSwitchedAt = now;
+  }
+  if (upActive == 1 && now - upSwitchedAt > PRIMARY_RETRY_MS) { upActive = 0; upMisses[0] = 0; }
+}
+static void loadUpstreams() {
+  if (!LittleFS.exists(UPSTREAM_CFG)) return;
+  File f = LittleFS.open(UPSTREAM_CFG, "r"); if (!f) return;
+  IPAddress a, b;
+  String l1 = f.readStringUntil('\n'), l2 = f.readStringUntil('\n'); f.close();
+  l1.trim(); l2.trim();
+  if (a.fromString(l1) && (uint32_t)a) upstream[0] = (uint32_t)a;
+  upstream[1] = (l2.length() && b.fromString(l2)) ? (uint32_t)b : 0;
+  upActive = 0;
+}
+static void saveUpstreams() {
+  File f = LittleFS.open(UPSTREAM_CFG, "w"); if (!f) return;
+  f.println(IPAddress(upstream[0]).toString());
+  f.println(upstream[1] ? IPAddress(upstream[1]).toString() : String(""));
+  f.close();
 }
 static void handleQuery(uint32_t cip, uint16_t cport, int qlen) {
   if (qlen < 13) return;
@@ -340,9 +405,7 @@ static bool handleDns() {
     else                 handleQuery(k->ip, k->port, k->len);
     free(k);
   }
-  const uint32_t now = millis();
-  for (int i = 0; i < MAX_PENDING; i++)
-    if (pending[i].used && now - pending[i].t0 > PENDING_TIMEOUT_MS) pending[i].used = false;
+  servicePending();
   return did;
 }
 
@@ -395,6 +458,8 @@ static void handleStats() {
              ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"blocking\":" + (blockingOn ? "true" : "false") +
+             ",\"up\":[\"" + IPAddress(upstream[0]).toString() + "\",\"" + (upstream[1] ? IPAddress(upstream[1]).toString() : String("")) + "\"]" +
+             ",\"upActive\":" + upActive +
              ",\"resumeIn\":" + (uint32_t)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0) +
              ",\"defcreds\":" + (defaultCreds() ? "true" : "false") +
              ",\"clients\":[";
@@ -742,7 +807,7 @@ void setup() {
     Serial.printf("blocklist: %u domains\n", numHashes);
     buildFlashIndex();
   }
-  loadList(customList); loadList(allowList); loadBanned(); loadUpdateCfg(); loadAuth();
+  loadList(customList); loadList(allowList); loadBanned(); loadUpdateCfg(); loadAuth(); loadUpstreams();
   Serial.printf("custom: %d, allowed: %d, banned: %d\n", customList.n, allowList.n, numBanned);
 
   // Hold BOOT at power-on to wipe saved WiFi + admin password and force the setup portal
@@ -791,6 +856,18 @@ void setup() {
     String p = web.arg("p");
     if (p.length() < MIN_PASS_LEN) { web.send(400, "text/plain", "password must be at least 8 characters"); return; }
     saveAuth(p); web.send(200, "text/plain", "password changed (network OTA uses it after the next reboot)");
+  });
+  web.on("/setupstream", []() {             // /setupstream?p=9.9.9.9&s=149.112.112.112  (s empty = none)
+    if (!requireAuth()) return;
+    IPAddress a, b; String ss = web.arg("s"); ss.trim();
+    const uint32_t self = (uint32_t)WiFi.localIP();
+    if (!a.fromString(web.arg("p")) || !(uint32_t)a || (uint32_t)a == self ||
+        (ss.length() && (!b.fromString(ss) || !(uint32_t)b || (uint32_t)b == self))) {
+      web.send(400, "text/plain", "need a valid primary IPv4 (and optional secondary), not this device"); return;
+    }
+    upstream[0] = (uint32_t)a; upstream[1] = ss.length() ? (uint32_t)b : 0;
+    upActive = 0; upMisses[0] = upMisses[1] = 0;
+    saveUpstreams(); web.send(200, "text/plain", "ok");
   });
   web.on("/resume", []() { if (!requireAuth()) return; blockingOn = true; resumeAt = 0; web.send(200, "text/plain", "resumed"); });
   web.on("/forgetwifi", []() { if (!requireAuth()) return; web.send(200, "text/plain", "cleared — rebooting into setup portal");
