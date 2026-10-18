@@ -130,6 +130,12 @@ The dashboard at **http://c3adblock.local** does it all:
   on a schedule. A fresh default list is rebuilt **every Monday** by GitHub Actions and
   published at a stable URL, so pasting this once keeps a device current on its own:
   `https://github.com/M-Abozaid/esp32-c3-adblock/releases/download/blocklist/blocklist.bin`
+
+  Remote downloads are checked before they replace the current list: HTTPS certificates
+  are verified against Mozilla's root CAs embedded in the firmware (`certs/`, regenerate
+  with `python3 tools/gen_crt_bundle.py certs/x509_crt_bundle.bin`), and if a
+  `blocklist.bin.sha256` sits next to the URL (the weekly release publishes one) the
+  download must match it. DNS keeps being answered while the download runs.
 - **Firmware** — upload `.pio/build/c3/firmware.bin` under *Firmware → OTA update*; the
   device verifies it and reboots into the new image. Or push over WiFi from the CLI:
   ```bash

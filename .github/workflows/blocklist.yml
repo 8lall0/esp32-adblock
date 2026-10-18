@@ -3,6 +3,7 @@ name: blocklist
 # Rebuilds the default blocklist weekly and publishes it at a stable URL:
 #   https://github.com/M-Abozaid/esp32-c3-adblock/releases/download/blocklist/blocklist.bin
 # Point a device's "Remote auto-update" at that URL and it stays current on its own.
+# blocklist.bin.sha256 is published next to it; the device verifies the download against it.
 on:
   schedule:
     - cron: "17 4 * * 1"   # Mondays 04:17 UTC
@@ -42,4 +43,8 @@ jobs:
           else
             gh release create blocklist --title "Weekly blocklist" --notes "$notes" --latest=false
           fi
+          sha256sum blocklist.bin > blocklist.bin.sha256
+          # checksum first: a device fetching between the two uploads then sees a mismatch
+          # (and keeps its old list) rather than a new list it can't verify
+          gh release upload blocklist blocklist.bin.sha256 --clobber
           gh release upload blocklist blocklist.bin --clobber
