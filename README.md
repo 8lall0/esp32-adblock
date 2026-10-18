@@ -74,10 +74,10 @@ One USB flash to get going — after that, **firmware and blocklist both update 
 # 1. copy the secrets template (gitignored, stays local) and edit it:
 #    - WIFI_SSID / WIFI_PASS are optional — leave the placeholders and use the
 #      on-device setup portal instead (below).
-#    - WEB_USER / WEB_PASS / OTA_PASS are NOT optional: they gate the dashboard's
-#      state-changing endpoints (/ban, /addblock, /upload, /update, /setupdate,
-#      /forgetwifi) and network OTA. Pick real values — these used to be wide
-#      open to anyone on the LAN.
+#    - WEB_PASS / OTA_PASS gate the dashboard's state-changing endpoints (/ban,
+#      /addblock, /upload, /update, /setupdate, /forgetwifi) and network OTA. Set
+#      real values here, or leave the placeholders and pick an admin password in
+#      the setup portal (it's then required there, and stored on the device).
 cp src/secrets.example.h src/secrets.h
 #    then edit src/secrets.h
 
@@ -113,9 +113,12 @@ can't be downloaded the build stops instead of silently producing a smaller list
 
 If it can't connect (or you never set `secrets.h`), it starts an open access point
 **`C3-AdBlock-XXXX`** with a captive portal — join it from a phone, pick your network,
-type the password, done. To move it to a new network later: click **Forget WiFi** on
+type the password, done. If no real password is compiled in, the portal also asks for an
+**admin password** for the dashboard and OTA (stored on the device, changeable later under
+*Security* on the dashboard). To move it to a new network later: click **Forget WiFi** on
 the dashboard, or hold the **BOOT** button while powering on, and the setup portal
-comes back. (`/forgetwifi` requires auth now, so it's no longer a bare URL you can
+comes back. Holding BOOT also resets the admin password, so it's the recovery path if you
+forget it. (`/forgetwifi` requires auth now, so it's no longer a bare URL you can
 just visit — see Security below.)
 
 ## Over-the-air updates (no more USB)
@@ -140,15 +143,16 @@ single-app partition table (no firmware OTA). Pick your tradeoff in `partitions.
 ## Security
 
 The dashboard's read-only view (`/`, `/stats.json`) stays open, but every
-state-changing endpoint requires **HTTP Basic Auth** (`WEB_USER`/`WEB_PASS` from
-`secrets.h`):
+state-changing endpoint requires **HTTP Basic Auth** (user `WEB_USER`, password
+`WEB_PASS` from `secrets.h`, or the admin password set in the setup portal / dashboard,
+which takes precedence):
 
-- `/ban`, `/addblock`, `/unblock`, `/forgetwifi`
+- `/ban`, `/addblock`, `/unblock`, `/allow`, `/unallow`, `/forgetwifi`, `/setpass`
 - `/upload`, `/update` (blocklist and firmware OTA)
 - `/setupdate`, `/fetchnow`
 
 Network OTA (`ArduinoOTA`, e.g. `pio run -t upload --upload-port c3adblock.local
---upload-protocol espota`) requires `OTA_PASS` from the same file.
+--upload-protocol espota`) requires `OTA_PASS`, or the admin password if one is set.
 
 Without this, anyone who could reach the device on the LAN could reflash it
 with arbitrary firmware or rewrite the blocklist with zero credentials — worth
@@ -178,11 +182,10 @@ no longer a bare URL you can visit directly; use the dashboard button instead.
 
 **Default credentials:** if `secrets.h` still has the placeholder
 `CHANGE_ME_WEB_PASSWORD` / `CHANGE_ME_OTA_PASSWORD` values from
-`secrets.example.h`, the device boots with a "password" that's public (it's
-sitting in this repo's example file). The firmware logs a warning over serial
-and shows a banner on the dashboard when this is the case — but it will still
-boot and run, so don't skip setting real values in `secrets.h` before trusting
-this on a network you don't fully control.
+`secrets.example.h` (as prebuilt firmware does), the setup portal refuses to save
+until you choose an admin password. A device that was already provisioned before
+this change keeps working with the public placeholder; the firmware logs a warning
+over serial and shows a banner on the dashboard until you set one under *Security*.
 
 Out of scope for now: the WiFi setup portal's access point (`C3-AdBlock-XXXX`)
 is still open (unencrypted) by design — it needs to be joinable without knowing

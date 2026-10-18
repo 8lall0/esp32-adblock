@@ -74,6 +74,12 @@ Preferences prefs;
 DNSServer   dnsPortal;
 String      portalOpts;             // <option> list of scanned networks, built once at portal start
 
+// Admin password for the dashboard (user WEB_USER) and network OTA. One set in the setup
+// portal or on the dashboard is stored in NVS and overrides WEB_PASS/OTA_PASS from secrets.h,
+// so prebuilt firmware (web flasher, CI) doesn't ship with the public placeholder passwords.
+String webPass, otaPass;
+static const unsigned MIN_PASS_LEN = 8;
+
 // blocking pause (Pi-hole-style "disable for a while")
 bool     blockingOn = true;
 uint32_t resumeAt   = 0;            // millis() to auto-resume; 0 = paused indefinitely / not paused
@@ -363,6 +369,21 @@ static String htmlEscape(const String& s) {
   return o;
 }
 
+static void loadAuth() {
+  prefs.begin("auth", false);
+  String p = prefs.isKey("pass") ? prefs.getString("pass") : "";
+  prefs.end();
+  webPass = p.length() ? p : String(WEB_PASS);
+  otaPass = p.length() ? p : String(OTA_PASS);
+}
+// ArduinoOTA only accepts a password before begin(), so OTA picks up a change on next boot.
+static void saveAuth(const String& p) {
+  prefs.begin("auth", false); prefs.putString("pass", p); prefs.end();
+  loadAuth();
+}
+static bool defaultCreds() { return webPass.startsWith("CHANGE_ME") || otaPass.startsWith("CHANGE_ME"); }
+static bool checkAuth() { return web.authenticate(WEB_USER, webPass.c_str()); }
+
 #include "page.h"   // dashboard HTML (PROGMEM) — see issue #6
 
 static void handleStats() {
@@ -374,7 +395,7 @@ static void handleStats() {
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"blocking\":" + (blockingOn ? "true" : "false") +
              ",\"resumeIn\":" + (uint32_t)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0) +
-             ",\"defcreds\":" + ((strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0) ? "true" : "false") +
+             ",\"defcreds\":" + (defaultCreds() ? "true" : "false") +
              ",\"clients\":[";
   for (int i = 0; i < numClients; i++) { Dev& c = clients[i]; IPAddress ip(c.ip);
     j += (i ? "," : ""); j += "{\"ip\":\"" + ip.toString() + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
@@ -404,7 +425,7 @@ static const char* CSRF_HEADER = "X-Requested-With";
 static const char* CSRF_VALUE  = "c3-adblock";
 static bool requireAuth() {
   if (web.header(CSRF_HEADER) != CSRF_VALUE) { web.send(403, "text/plain", "missing CSRF header"); return false; }
-  if (web.authenticate(WEB_USER, WEB_PASS)) return true;
+  if (checkAuth()) return true;
   web.requestAuthentication();
   return false;
 }
@@ -478,7 +499,7 @@ static void handleUpload() {
   HTTPUpload& u = web.upload();
   switch (u.status) {
     case UPLOAD_FILE_START:
-      upAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
+      upAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && checkAuth();
       if (!upAuthOk) { Serial.println("[ota] blocklist upload: auth/CSRF check failed"); break; }
       upOk = false;
       beginBlocklistSwap(web.clientContentLength() > 0 ? web.clientContentLength() : 0);
@@ -562,7 +583,7 @@ static void handleFwUpdateDone() {
 static void handleFwUpload() {
   HTTPUpload& u = web.upload();
   if (u.status == UPLOAD_FILE_START) {
-    fwAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
+    fwAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && checkAuth();
     if (!fwAuthOk) { Serial.println("[fw-ota] auth/CSRF check failed, rejecting flash"); return; }
     Serial.printf("[fw-ota] %s\n", u.filename.c_str());
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
@@ -590,7 +611,7 @@ static bool hasCreds() {
 static bool connectWiFi() {
   prefs.begin("wifi", true);
   String ss = prefs.getString("ssid", "");
-  String pw = prefs.getString("pass", "");
+  String pw = prefs.isKey("pass") ? prefs.getString("pass") : "";
   prefs.end();
   const char* ssid = ss.length() ? ss.c_str() : WIFI_SSID;
   const char* pass = ss.length() ? pw.c_str() : WIFI_PASS;
@@ -613,14 +634,22 @@ static void handlePortalRoot() {
     "<form method=POST action=/wifisave>"
     "<input list=nets name=s placeholder='WiFi name' required style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>"
     "<datalist id=nets>" + portalOpts + "</datalist>"
-    "<input name=p type=password placeholder='Password' style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>"
+    "<input name=p type=password placeholder='WiFi password' style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>"
+    "<p style='color:#8b949e;margin:14px 0 0'>Admin password for the dashboard (user <b>" + htmlEscape(WEB_USER) + "</b>) and OTA updates" +
+    String(defaultCreds() ? ":" : " &mdash; leave empty to keep the current one:") + "</p>"
+    "<input name=a type=password minlength=8 placeholder='Admin password (8+ characters)'" + String(defaultCreds() ? " required" : "") +
+    " style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>"
     "<button style='width:100%;padding:12px;margin-top:8px;border-radius:6px;border:0;background:#3fb950;color:#000;font-weight:600;cursor:pointer'>Connect</button>"
     "</form></body>";
   web.send(200, "text/html", html);
 }
 static void handleWifiSave() {
-  String ss = web.arg("s"), pw = web.arg("p");
+  String ss = web.arg("s"), pw = web.arg("p"), ap = web.arg("a");
   if (!ss.length()) { web.send(400, "text/plain", "missing WiFi name"); return; }
+  if (ap.length() ? ap.length() < MIN_PASS_LEN : defaultCreds()) {
+    web.send(400, "text/plain", "admin password must be at least 8 characters"); return;
+  }
+  if (ap.length()) saveAuth(ap);
   prefs.begin("wifi", false); prefs.putString("ssid", ss); prefs.putString("pass", pw); prefs.end();
   web.send(200, "text/html", "<!doctype html><meta charset=utf-8><body style='font:16px system-ui;text-align:center;margin-top:60px'>"
                              "&#9989; Saved. Restarting and joining <b>" + htmlEscape(ss) + "</b>&hellip;<br><br>"
@@ -664,10 +693,11 @@ void setup() {
     Serial.printf("blocklist: %u domains\n", numHashes);
     buildFlashIndex();
   }
-  loadList(customList); loadList(allowList); loadBanned(); loadUpdateCfg();
+  loadList(customList); loadList(allowList); loadBanned(); loadUpdateCfg(); loadAuth();
   Serial.printf("custom: %d, allowed: %d, banned: %d\n", customList.n, allowList.n, numBanned);
 
-  // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
+  // Hold BOOT at power-on to wipe saved WiFi + admin password and force the setup portal
+  // (physical access is the recovery path for a forgotten password).
 #if CONFIG_IDF_TARGET_ESP32C3
   const int BOOT_PIN = 9;     // C3 BOOT button
 #else
@@ -676,15 +706,16 @@ void setup() {
   pinMode(BOOT_PIN, INPUT_PULLUP);
   if (digitalRead(BOOT_PIN) == LOW) { delay(60);
     if (digitalRead(BOOT_PIN) == LOW) { prefs.begin("wifi", false); prefs.clear(); prefs.end();
-      Serial.println("[setup] BOOT held -> cleared saved WiFi"); } }
+      prefs.begin("auth", false); prefs.clear(); prefs.end(); loadAuth();
+      Serial.println("[setup] BOOT held -> cleared saved WiFi and admin password"); } }
 
   if (!connectWiFi()) startConfigPortal();   // portal blocks + reboots on save; returns only when connected
   Serial.printf("WiFi up: %s\n", WiFi.localIP().toString().c_str());
   if (MDNS.begin("c3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c3adblock.local"); }
 
-  if (strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0)
-    Serial.println("[WARN] secrets.h still has placeholder WEB_PASS/OTA_PASS — those are public "
-                    "(they're in the repo's example file). Set real values before trusting this "
+  if (defaultCreds())
+    Serial.println("[WARN] admin password is still the public placeholder from secrets.example.h. "
+                    "Set one on the dashboard (Security) or in the setup portal before trusting this "
                     "device on a network you don't fully control.");
 
   pktQ = xQueueCreate(PKT_QUEUE, sizeof(Pkt*));
@@ -706,6 +737,12 @@ void setup() {
     blockingOn = false; resumeAt = (s > 0) ? millis() + (uint32_t)s * 1000UL : 0;
     web.send(200, "text/plain", "paused");
   });
+  web.on("/setpass", HTTP_POST, []() {
+    if (!requireAuth()) return;
+    String p = web.arg("p");
+    if (p.length() < MIN_PASS_LEN) { web.send(400, "text/plain", "password must be at least 8 characters"); return; }
+    saveAuth(p); web.send(200, "text/plain", "password changed (network OTA uses it after the next reboot)");
+  });
   web.on("/resume", []() { if (!requireAuth()) return; blockingOn = true; resumeAt = 0; web.send(200, "text/plain", "resumed"); });
   web.on("/forgetwifi", []() { if (!requireAuth()) return; web.send(200, "text/plain", "cleared — rebooting into setup portal");
     prefs.begin("wifi", false); prefs.clear(); prefs.end(); delay(500); ESP.restart(); });
@@ -720,7 +757,7 @@ void setup() {
   });
   web.begin();
   ArduinoOTA.setHostname("c3adblock");   // pio run -t upload --upload-port c3adblock.local
-  ArduinoOTA.setPassword(OTA_PASS);      // network OTA was unauthenticated upstream
+  ArduinoOTA.setPassword(otaPass.c_str());   // network OTA was unauthenticated upstream
   ArduinoOTA.begin();
   Serial.println("DNS :53 + dashboard :80 + OTA up");
 }

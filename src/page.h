@@ -20,7 +20,7 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 </style></head><body>
 <header><h1>🛡️ C3 AdBlock <span id=host></span></h1></header><div class=wrap>
 <div id=credwarn style="display:none;background:#3b1d1d;border:1px solid #f85149;color:#ffb3ae;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:13px">
-⚠️ <b>Default credentials in use.</b> WEB_PASS/OTA_PASS in <code>secrets.h</code> are still the placeholder values — anyone can read them in the public repo. Set real values and reflash.
+⚠️ <b>Default credentials in use.</b> The admin password is still the placeholder from <code>secrets.example.h</code> — anyone can read it in the public repo. Set a real one under <b>Security</b> below.
 </div>
 <div id=blockbar style="display:flex;align-items:center;gap:12px;margin-bottom:14px;padding:12px 14px;background:#161b22;border:1px solid #30363d;border-radius:8px">
 <span id=blockdot style=font-size:20px>🛡️</span><b id=blockstate style=flex:1 data-on=1>Blocking active</b>
@@ -45,6 +45,9 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 <h2>FIRMWARE &mdash; OTA UPDATE</h2>
 <form id=fwf style=margin-bottom:6px><input type=file id=fwb accept=.bin><button>Flash firmware</button> <span id=fwmsg style=color:#8b949e></span></form>
 <div style="color:#8b949e;font-size:12px;margin-bottom:18px">upload <code>.pio/build/c3/firmware.bin</code> &mdash; device verifies it and reboots into it</div>
+<h2>SECURITY</h2>
+<div style=margin-bottom:6px><input id=np type=password placeholder="new admin password" size=24 minlength=8><button onclick=setPass()>Change password</button> <span id=pmsg style=color:#8b949e></span></div>
+<div style="color:#8b949e;font-size:12px;margin-bottom:18px">used for the dashboard and network OTA; overrides <code>secrets.h</code>. Forgot it? Hold BOOT while powering on to reset it in the setup portal.</div>
 <h2>WIFI</h2>
 <div style=margin-bottom:18px><button onclick="if(confirm('Forget saved WiFi and reboot into the setup portal?'))forgetWifi()">Forget WiFi</button></div>
 </div><script>
@@ -82,6 +85,9 @@ function allowDom(){let d=adom.value.trim();if(d){fetch('/allow?d='+encodeURICom
 al.addEventListener('click',e=>{if(e.target.classList.contains('rmbtn'))fetch('/unallow?d='+encodeURIComponent(e.target.dataset.d),{headers:CSRF_HDRS}).then(load)});
 function saveUpd(){fetch('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24),{headers:CSRF_HDRS}).then(load)}
 function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow',{headers:CSRF_HDRS}).then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
+function setPass(){let p=np.value;if(p.length<8){pmsg.textContent='8+ characters';return}
+fetch('/setpass',{method:'POST',headers:{...CSRF_HDRS,'Content-Type':'application/x-www-form-urlencoded'},body:'p='+encodeURIComponent(p)})
+.then(r=>r.text()).then(t=>{pmsg.textContent=t;np.value='';load()})}
 function forgetWifi(){fetch('/forgetwifi',{headers:CSRF_HDRS}).then(r=>r.text()).then(t=>alert(t))}
 fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';
 let fd=new FormData();fd.append('f',f);
