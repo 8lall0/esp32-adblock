@@ -45,6 +45,7 @@ makes it undeniable.
 
 - Any **ESP32-C3** board (tested on a C3 SuperMini), 4 MB flash, **no PSRAM needed**
 - Classic **ESP32** (DevKit / WROOM, 4 MB) also builds: `pio run -e esp32dev -t upload` (community-contributed, compile-tested; the C3 is the tested target)
+- **ESP32-S3** (4 MB flash or more) also works: `pio run -e s3 -t upload`. The env pins `board_upload.flash_size = 4MB` so it boots on 4 MB modules; boards with more flash run fine with it too
 - Power it from a **stable USB source** (a phone charger or your router's USB port).
   Cheap/loose USB-C→A adapters can brown out the radio during WiFi transmit.
 - A **USB-A → USB-C dongle** lets it plug straight into the spare USB port on the
