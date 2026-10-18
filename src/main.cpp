@@ -5,7 +5,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
+#include <AsyncUDP.h>           // DNS sockets (raw lwIP: no 6-packet socket rx queue)
 #include <LittleFS.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
@@ -37,7 +37,7 @@ static const int CACHE_SIZE = 256;       // must be power of 2
 static const int MAX_RANGE = 256;        // max hashes per index bucket (fine up to ~1M hashes; flash holds far fewer)
 
 // ---- globals ----
-WiFiUDP dnsServer, upstreamCli;
+AsyncUDP dnsSock, upstreamSock;
 WebServer web(80);
 File blocklist;
 uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0;
@@ -249,55 +249,93 @@ static int buildBlocked(int qend, uint16_t qtype) {
   const uint8_t ans[] = {0xC0,0x0C, 0,1, 0,1, 0,0,1,0x2C, 0,4, 0,0,0,0};
   memcpy(buf + qend, ans, sizeof(ans)); return qend + sizeof(ans);
 }
-// Forward to upstream and wait for the reply that actually belongs to THIS query.
-// Issue #10: after one timeout the late reply used to sit in the socket and get relayed
-// to the next client (every answer shifted by one). Now: drain stale datagrams first,
-// send with a fresh random txid, and only accept a reply whose txid, question section,
-// and source address/port match. The client's own txid is restored on the way back.
-static int forwardUpstream(int qlen, int qend) {
-  upstreamCli.flush();                                   // release any half-read buffer
-  while (upstreamCli.parsePacket() > 0) upstreamCli.flush();   // drop stale late replies
-  const uint8_t cid0 = buf[0], cid1 = buf[1];
-  const uint16_t wid = (uint16_t)esp_random();
-  uint8_t q[260]; int ql = qend - 12;
-  const bool haveQ = ql > 0 && ql <= (int)sizeof(q) && qend <= qlen;
-  if (haveQ) memcpy(q, buf + 12, ql);
-  buf[0] = wid >> 8; buf[1] = wid & 0xFF;
-  upstreamCli.beginPacket(UPSTREAM, UPSTREAM_PORT); upstreamCli.write(buf, qlen); upstreamCli.endPacket();
-  const uint32_t t0 = millis();
-  while (millis() - t0 < 1000) {                         // deadline, not a retry count
-    int sz = upstreamCli.parsePacket();
-    if (sz <= 0) { delay(1); continue; }
-    const bool fromUp = upstreamCli.remoteIP() == UPSTREAM && upstreamCli.remotePort() == UPSTREAM_PORT;
-    int n = upstreamCli.read(buf, sizeof(buf));
-    upstreamCli.flush();                                 // oversized datagram can't strand rx_buffer
-    if (!fromUp || n < 12 || sz > (int)sizeof(buf)) continue;
-    if (buf[0] != (wid >> 8) || buf[1] != (wid & 0xFF)) continue;
-    if (haveQ && (n < 12 + ql || memcmp(buf + 12, q, ql) != 0)) continue;
-    buf[0] = cid0; buf[1] = cid1;
-    return n;
-  }
-  return 0;
+// Packet intake. The framework's precompiled lwIP gives each BSD/WiFiUDP socket a 6-packet
+// rx queue, so a browser's burst of lookups (a page load fires dozens) lost everything past
+// the sixth. AsyncUDP receives straight from lwIP; its callbacks (async_udp task) only copy
+// the datagram into pktQ, and loop() does all the DNS work, so no state is shared across
+// tasks except the queue itself.
+struct Pkt { uint32_t ip; uint16_t port; bool fromUpstream; uint16_t len; uint8_t data[]; };
+static const int PKT_QUEUE = 64;
+static QueueHandle_t pktQ;
+static void enqueuePkt(AsyncUDPPacket& p, bool fromUpstream) {
+  size_t n = p.length();
+  if (p.isIPv6() || n < 12 || n > sizeof(buf)) return;
+  Pkt* k = (Pkt*)malloc(sizeof(Pkt) + n); if (!k) return;
+  k->ip = (uint32_t)p.remoteIP(); k->port = p.remotePort(); k->fromUpstream = fromUpstream; k->len = n;
+  memcpy(k->data, p.data(), n);
+  if (xQueueSend(pktQ, &k, 0) != pdTRUE) free(k);  // full: drop, the client retries
 }
-// Drain a whole RX burst per call (capped, so web/OTA still get a turn) instead of
-// one packet per loop iteration. Returns true if any query was handled this call.
-static bool handleDns() {
-  bool did = false;
-  for (int budget = 0; budget < 16; budget++) {
-    int sz = dnsServer.parsePacket(); if (sz <= 0) break;
-    did = true;
-    IPAddress cip = dnsServer.remoteIP(); uint16_t cport = dnsServer.remotePort();
-    int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 13) continue;
-    char domain[256]; uint16_t qtype = 0; int qend = qlen;
-    size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
-    Dev* c = getClient((uint32_t)cip);
-    bool ban = c && c->banned;
-    bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
-    int rlen;
-    if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
-    else         { rlen = forwardUpstream(qlen, qend);     totalAllowed++; if (c) c->allowed++; }
-    if (rlen > 0) { dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket(); }
+static void sendTo(AsyncUDP& sock, uint32_t ip, uint16_t port, int len) { sock.writeTo(buf, len, IPAddress(ip), port); }
+
+// Upstream forwarding is asynchronous: a query is sent with a fresh random txid and parked
+// in this table, and replies are matched back to their client whenever they arrive. The old
+// code waited up to 1 s per query, so one slow lookup stalled every other client, the
+// dashboard and OTA. A reply is only accepted if its source address/port, txid and question
+// section match a pending query (issue #10: late replies must never reach the wrong client);
+// the client's own txid is restored on the way back.
+static const int MAX_PENDING = 32;
+static const uint32_t PENDING_TIMEOUT_MS = 2000;   // clients retry on their own after this
+struct Pending { bool used; uint16_t wid, cport; uint8_t cid0, cid1; uint32_t cip, t0; uint16_t ql; uint8_t q[256]; };
+static Pending pending[MAX_PENDING];
+
+static void forwardUpstream(uint32_t cip, uint16_t cport, int qlen, int qend) {
+  Pending* p = nullptr;
+  for (int i = 0; i < MAX_PENDING; i++) {          // free slot, else evict the oldest
+    if (!pending[i].used) { p = &pending[i]; break; }
+    if (!p || (int32_t)(pending[i].t0 - p->t0) < 0) p = &pending[i];
   }
+  uint16_t wid; bool clash;
+  do {                                             // txid unique among in-flight queries
+    wid = (uint16_t)esp_random(); clash = false;
+    for (int i = 0; i < MAX_PENDING; i++) if (pending[i].used && &pending[i] != p && pending[i].wid == wid) clash = true;
+  } while (clash);
+  int ql = qend - 12;
+  p->ql = (ql > 0 && ql <= (int)sizeof(p->q) && qend <= qlen) ? ql : 0;
+  if (p->ql) memcpy(p->q, buf + 12, p->ql);
+  p->used = true; p->wid = wid; p->cip = cip; p->cport = cport; p->cid0 = buf[0]; p->cid1 = buf[1]; p->t0 = millis();
+  buf[0] = wid >> 8; buf[1] = wid & 0xFF;
+  sendTo(upstreamSock, (uint32_t)UPSTREAM, UPSTREAM_PORT, qlen);
+}
+static void handleReply(uint32_t ip, uint16_t port, int n) {
+  if (ip != (uint32_t)UPSTREAM || port != UPSTREAM_PORT) return;
+  const uint16_t wid = (buf[0] << 8) | buf[1];
+  for (int i = 0; i < MAX_PENDING; i++) {
+    Pending& p = pending[i];
+    if (!p.used || p.wid != wid) continue;
+    if (p.ql && (n < 12 + p.ql || memcmp(buf + 12, p.q, p.ql) != 0)) return;
+    buf[0] = p.cid0; buf[1] = p.cid1; p.used = false;
+    sendTo(dnsSock, p.cip, p.cport, n);
+    return;
+  }
+}
+static void handleQuery(uint32_t cip, uint16_t cport, int qlen) {
+  if (qlen < 13) return;
+  char domain[256]; uint16_t qtype = 0; int qend = 0;   // qend stays 0 if the question can't be parsed
+  size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
+  Dev* c = getClient(cip);
+  bool ban = c && c->banned;
+  bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
+  if (blocked) {
+    if (!qend) qend = qlen;                        // banned client sent something unparseable
+    int rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++;
+    sendTo(dnsSock, cip, cport, rlen);
+  } else {
+    forwardUpstream(cip, cport, qlen, qend); totalAllowed++; if (c) c->allowed++;
+  }
+}
+// Drain a burst per call (capped, so web/OTA still get a turn). Returns true if it did work.
+static bool handleDns() {
+  bool did = false; Pkt* k;
+  for (int budget = 0; budget < 32 && xQueueReceive(pktQ, &k, 0) == pdTRUE; budget++) {
+    did = true;
+    memcpy(buf, k->data, k->len);
+    if (k->fromUpstream) handleReply(k->ip, k->port, k->len);
+    else                 handleQuery(k->ip, k->port, k->len);
+    free(k);
+  }
+  const uint32_t now = millis();
+  for (int i = 0; i < MAX_PENDING; i++)
+    if (pending[i].used && now - pending[i].t0 > PENDING_TIMEOUT_MS) pending[i].used = false;
   return did;
 }
 
@@ -649,7 +687,11 @@ void setup() {
                     "(they're in the repo's example file). Set real values before trusting this "
                     "device on a network you don't fully control.");
 
-  dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
+  pktQ = xQueueCreate(PKT_QUEUE, sizeof(Pkt*));
+  dnsSock.listen(IPAddress(0, 0, 0, 0), DNS_PORT);   // IPv4 only: the client table keys on IPv4
+  upstreamSock.listen(IPAddress(0, 0, 0, 0), 0);     // ephemeral source port for upstream queries
+  dnsSock.onPacket([](AsyncUDPPacket& p) { enqueuePkt(p, false); });
+  upstreamSock.onPacket([](AsyncUDPPacket& p) { enqueuePkt(p, true); });
   { const char* hdrs[] = { CSRF_HEADER }; web.collectHeaders(hdrs, 1); }  // needed for requireAuth()'s CSRF check
   web.on("/", []() { web.send_P(200, "text/html", PAGE); });
   web.on("/stats.json", handleStats);
