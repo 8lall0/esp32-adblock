@@ -1,11 +1,11 @@
 #include "cache.h"
 
 // Upstream answers are kept for their TTL (capped) so repeat lookups skip the round trip.
-// Sized at boot to the hardware: with working PSRAM, CACHE_SLOTS_PSRAM entries there;
+// Sized at boot to the hardware: with PSRAM in the heap, CACHE_SLOTS_PSRAM entries there;
 // otherwise up to a quarter of the free internal heap (16..128 entries, ~0.5 KB each), which
 // leaves room for the TLS handshake of remote blocklist updates. 2-way set associative.
 // Only answers that fit in 512 bytes are kept: every client accepts that size.
-static const int CACHE_SLOTS_PSRAM = 1024, CACHE_SLOTS_MIN = 16, CACHE_SLOTS_MAX = 128;   // powers of 2
+static const int CACHE_SLOTS_PSRAM = 2048, CACHE_SLOTS_MIN = 16, CACHE_SLOTS_MAX = 128;   // powers of 2 (2048 ~ 1.1 MB)
 static const int CACHE_MAX_ANSWER = 512;
 static const uint32_t CACHE_MAX_TTL = 3600;
 struct CacheEntry { uint64_t key; uint32_t storedAt, ttl; uint16_t len; uint8_t data[CACHE_MAX_ANSWER]; };
@@ -13,7 +13,7 @@ static CacheEntry* ansCache = nullptr; int cacheSlots = 0;
 uint32_t cacheHits = 0;
 
 void initAnswerCache() {
-  if (psramFound()) {
+  if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > CACHE_SLOTS_PSRAM * sizeof(CacheEntry)) {
     ansCache = (CacheEntry*)heap_caps_calloc(CACHE_SLOTS_PSRAM, sizeof(CacheEntry), MALLOC_CAP_SPIRAM);
     if (ansCache) cacheSlots = CACHE_SLOTS_PSRAM;
   }

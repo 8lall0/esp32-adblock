@@ -247,7 +247,7 @@ dig @<c3-ip> github.com        # -> real IP  (forwarded)
 - ✅ Captive-portal WiFi setup (no hardcoded creds) + one-click browser web-installer
 - ✅ Allowlist (never-blocked domains) next to custom blocks
 - ✅ Primary + secondary upstream resolver, set on the dashboard, with automatic failover
-- ✅ Answer cache honouring TTLs (sized to the board: up to 128 entries in internal RAM, 1024 with PSRAM)
+- ✅ Answer cache honouring TTLs (sized to the board: up to 128 entries in internal RAM, 2048 with PSRAM)
 - ✅ DNS over IPv6 too, with optional RDNSS announcements
 - ✅ DNS over TCP (port 53), so answers too big for UDP (long TXT records, DNSSEC) still resolve
 - ✅ Remote blocklist downloads verified (TLS against Mozilla roots + optional `.sha256`)
