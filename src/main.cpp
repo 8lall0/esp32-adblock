@@ -22,6 +22,7 @@
 #include "blocklist.h"
 #include "clients.h"
 #include "dns.h"
+#include "dot.h"
 #include "ipv6.h"
 #include "portal.h"
 #include "updates.h"
@@ -61,6 +62,8 @@ void setup() {
   webBegin();
   ArduinoOTA.setHostname("c3adblock");   // pio run -t upload --upload-port c3adblock.local
   ArduinoOTA.setPassword(otaPass.c_str());   // network OTA was unauthenticated upstream
+  ArduinoOTA.onStart([]() { dotPause(true); });                       // see dotPause()
+  ArduinoOTA.onError([](ota_error_t) { dotPause(false); });
   ArduinoOTA.begin();
   Serial.println("DNS :53 + dashboard :80 + OTA up");
 }

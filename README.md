@@ -109,6 +109,20 @@ un-blocks that exact entry — it can't carve a subdomain out of a blocked paren
 can't be downloaded the build stops instead of silently producing a smaller list
 (`--allow-missing` to override).
 
+### Encrypted upstream (DNS-over-TLS)
+
+Forwarded queries go to the upstream resolver over **DNS-over-TLS** (port 853) instead of
+plain DNS, so the ISP or anyone on the path can't read or alter them. The resolver's
+certificate is verified against the Mozilla roots built into the firmware; the TLS hostname
+is filled in for Quad9, Cloudflare, Google and AdGuard (enter it on the dashboard for others).
+One connection is kept open (with a tiny keepalive while the network is in use), so lookups
+are as fast as plain DNS.
+
+- **On by default on boards with PSRAM** (the TLS session needs ~60 KB); opt-in elsewhere.
+- If the TLS connection can't be made, queries fall back to plain DNS for 30 s and the
+  dashboard says so; **strict** mode answers SERVFAIL instead, so nothing ever leaves
+  unencrypted.
+
 ### IPv6
 
 The device answers DNS on IPv6 as well (its addresses are shown on the dashboard; on a LAN
@@ -168,7 +182,7 @@ state-changing endpoint requires **HTTP Basic Auth** (user `WEB_USER`, password
 `WEB_PASS` from `secrets.h`, or the admin password set in the setup portal / dashboard,
 which takes precedence):
 
-- `/ban`, `/addblock`, `/unblock`, `/allow`, `/unallow`, `/forgetwifi`, `/setpass`, `/reboot`, `/setupstream`, `/setra6`
+- `/ban`, `/addblock`, `/unblock`, `/allow`, `/unallow`, `/forgetwifi`, `/setpass`, `/reboot`, `/setupstream`, `/setdot`, `/setra6`, `/setname`
 - `/debug.json` (read-only, but it lists recent queries and why each was blocked/allowed/cached,
   which is browsing history)
 - `/upload`, `/update` (blocklist and firmware OTA)
@@ -247,6 +261,7 @@ dig @<c3-ip> github.com        # -> real IP  (forwarded)
 - ✅ Captive-portal WiFi setup (no hardcoded creds) + one-click browser web-installer
 - ✅ Allowlist (never-blocked domains) next to custom blocks
 - ✅ Primary + secondary upstream resolver, set on the dashboard, with automatic failover
+- ✅ Upstream queries encrypted with DNS-over-TLS (certificate-verified), optional strict mode
 - ✅ Answer cache honouring TTLs (sized to the board: up to 128 entries in internal RAM, 2048 with PSRAM)
 - ✅ DNS over IPv6 too, with optional RDNSS announcements
 - ✅ DNS over TCP (port 53), so answers too big for UDP (long TXT records, DNSSEC) still resolve

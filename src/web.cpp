@@ -7,6 +7,7 @@
 #include "cache.h"
 #include "clients.h"
 #include "dns.h"
+#include "dot.h"
 #include "ipv6.h"
 #include "portal.h"
 #include "updates.h"
@@ -47,7 +48,7 @@ static void handleStats() {
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"blocking\":" + (blockingOn ? "true" : "false") +
              ",\"up\":[\"" + IPAddress(upstream[0]).toString() + "\",\"" + (upstream[1] ? IPAddress(upstream[1]).toString() : String("")) + "\"]" +
-             ",\"upActive\":" + upActive +
+             ",\"upActive\":" + upActive + ",\"dot\":" + dotStatusJson() + ",\"dotFallbacks\":" + dotFallbacks +
              ",\"cacheHits\":" + cacheHits + ",\"cacheSlots\":" + cacheSlots + ",\"listInRam\":" + (blocklistInMemory() ? "true" : "false") + ",\"listRam\":\"" + blocklistMemState() + "\"" +
              ",\"resumeIn\":" + (uint32_t)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0) +
              ",\"defcreds\":" + (defaultCreds() ? "true" : "false") +
@@ -145,6 +146,7 @@ static void handleFwUpload() {
     fwAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && checkAuth();
     if (!fwAuthOk) { Serial.println("[fw-ota] auth/CSRF check failed, rejecting flash"); return; }
     Serial.printf("[fw-ota] %s\n", u.filename.c_str());
+    dotPause(true);                                // see dotPause()
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
   } else if (u.status == UPLOAD_FILE_WRITE) {
     if (!fwAuthOk) return;
@@ -152,10 +154,10 @@ static void handleFwUpload() {
   } else if (u.status == UPLOAD_FILE_END) {
     if (!fwAuthOk) return;
     if (Update.end(true)) Serial.printf("[fw-ota] %u bytes OK\n", u.totalSize);
-    else Update.printError(Serial);
+    else { Update.printError(Serial); dotPause(false); }
   } else if (u.status == UPLOAD_FILE_ABORTED) {
     if (!fwAuthOk) return;
-    Update.abort(); Serial.println("[fw-ota] aborted");
+    Update.abort(); dotPause(false); Serial.println("[fw-ota] aborted");
   }
 }
 
@@ -196,6 +198,12 @@ void webBegin() {
     Addr a; Dev* c = addrParse(web.arg("ip"), a) ? findClient(a) : nullptr;
     if (!c) { web.send(404, "text/plain", "no such client"); return; }
     setManualName(*c, web.arg("name")); web.send(200, "text/plain", "ok");
+  });
+  web.on("/setdot", []() {                  // /setdot?on=1&strict=0&n0=dns.quad9.net&n1=  (empty name = automatic)
+    if (!requireAuth()) return;
+    String n0 = web.arg("n0"), n1 = web.arg("n1"); n0.trim(); n1.trim();
+    setDot(web.arg("on") == "1", web.arg("strict") == "1", n0, n1);
+    web.send(200, "text/plain", "ok");
   });
   web.on("/setra6", []() {                  // /setra6?on=1 : announce the device as IPv6 DNS server
     if (!requireAuth()) return;

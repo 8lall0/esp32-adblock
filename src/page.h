@@ -38,7 +38,10 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 <h2>UPSTREAM DNS</h2>
 <div style=margin-bottom:6px><input id=up0 placeholder="primary, e.g. 9.9.9.9" size=16> <input id=up1 placeholder="secondary (optional)" size=16>
 <button onclick=saveUp()>Save</button> <span id=upmsg style=color:#8b949e></span></div>
-<div style="color:#8b949e;font-size:12px;margin-bottom:18px">queries go to the active one; unanswered ones are retried on the other after 0.7 s, and 3 misses in a row switch over. active: <span id=upact>&mdash;</span></div>
+<div style="color:#8b949e;font-size:12px;margin-bottom:8px">queries go to the active one; unanswered ones are retried on the other after 0.7 s, and 3 misses in a row switch over. active: <span id=upact>&mdash;</span></div>
+<div style=margin-bottom:6px><label><input type=checkbox id=dot> encrypt with DNS-over-TLS</label> &nbsp;<label><input type=checkbox id=dotstrict> strict (never fall back to plain DNS)</label></div>
+<div style=margin-bottom:6px>TLS names: <input id=dn0 size=20> <input id=dn1 size=20> <button onclick=saveDot()>Save</button> <span id=dotmsg style=color:#8b949e></span></div>
+<div style="color:#8b949e;font-size:12px;margin-bottom:18px">the certificate is checked against these names (filled in automatically for Quad9, Cloudflare, Google, AdGuard). DoT: <span id=dotst>&mdash;</span></div>
 <h2>IPV6</h2>
 <div style=margin-bottom:6px>device answers DNS on IPv6 too: <code id=ip6>&mdash;</code></div>
 <div style=margin-bottom:6px><label><input type=checkbox id=ra6 onchange=setRa()> announce this device as IPv6 DNS server</label> <span id=ramsg style=color:#8b949e></span></div>
@@ -91,6 +94,9 @@ if(document.activeElement!=uurl)uurl.value=s.upurl||'';
 if(document.activeElement!=uiv)uiv.value=s.upiv||24;
 ustat.textContent=s.upstat||'—';
 ip6.textContent=(s.ip6||[]).join('  ')||'no IPv6 address yet';if(document.activeElement!=ra6)ra6.checked=!!s.ra6;
+if(s.dot){const d=s.dot,ae=document.activeElement;if(ae!=dot)dot.checked=d.on;if(ae!=dotstrict)dotstrict.checked=d.strict;
+if(ae!=dn0){dn0.value=d.custom[0];dn0.placeholder=d.names[0]||'hostname needed'}if(ae!=dn1){dn1.value=d.custom[1];dn1.placeholder=d.names[1]||'hostname needed'}
+dotst.textContent=!d.on?'off (plain DNS)':d.state+(d.host?' to '+d.host+' ('+d.ip+')':'')+', '+fmt(d.sent)+' queries'+(s.dotFallbacks?', '+fmt(s.dotFallbacks)+' sent plain while it was down':'')+(d.err?' | last error: '+d.err:'');}
 if(s.up){if(document.activeElement!=up0)up0.value=s.up[0];if(document.activeElement!=up1)up1.value=s.up[1];upact.textContent=s.up[s.upActive]||'—';}}
 function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(()=>{dom.value='';load()})}}
 ct.addEventListener('click',e=>{let t=e.target;
@@ -110,6 +116,8 @@ function reboot(){fetch('/reboot',{headers:CSRF_HDRS}).then(r=>r.text()).then(t=
 function saveUp(){fetch('/setupstream?p='+encodeURIComponent(up0.value.trim())+'&s='+encodeURIComponent(up1.value.trim()),{headers:CSRF_HDRS})
 .then(r=>r.text()).then(t=>{upmsg.textContent=t;load()})}
 function setRa(){fetch('/setra6?on='+(ra6.checked?1:0),{headers:CSRF_HDRS}).then(r=>r.text()).then(t=>{ramsg.textContent=t;load()})}
+function saveDot(){fetch('/setdot?on='+(dot.checked?1:0)+'&strict='+(dotstrict.checked?1:0)+'&n0='+encodeURIComponent(dn0.value.trim())+'&n1='+encodeURIComponent(dn1.value.trim()),{headers:CSRF_HDRS})
+.then(r=>r.text()).then(t=>{dotmsg.textContent=t;load()})}
 function forgetWifi(){fetch('/forgetwifi',{headers:CSRF_HDRS}).then(r=>r.text()).then(t=>alert(t))}
 fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';
 let fd=new FormData();fd.append('f',f);

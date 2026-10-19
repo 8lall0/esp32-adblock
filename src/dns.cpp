@@ -9,6 +9,7 @@
 #include "blocklist.h"
 #include "cache.h"
 #include "clients.h"
+#include "dot.h"
 
 // Default upstream resolvers; both can be changed on the dashboard (saved to /upstream.cfg).
 #ifndef UPSTREAM_IP
@@ -50,7 +51,7 @@ static int buildBlocked(int qend, uint16_t qtype) {
 // the sixth. AsyncUDP receives straight from lwIP; its callbacks (async_udp task) only copy
 // the datagram into pktQ, and loop() does all the DNS work, so no state is shared across
 // tasks except the queue itself.
-struct Pkt { Addr from; uint16_t port; bool fromUpstream; uint16_t len; uint8_t data[]; };
+struct Pkt { Addr from; uint16_t port; bool fromUpstream, viaDot; uint16_t len; uint8_t data[]; };
 static const int PKT_QUEUE = 64;
 static QueueHandle_t pktQ;
 // The sender address is read from the IP header in front of the payload. AsyncUDPPacket's own
@@ -78,7 +79,7 @@ static void enqueuePkt(AsyncUDPPacket& p, bool fromUpstream) {
   if (!packetSource(p, from) || (fromUpstream && from.v6)) return;   // upstreams are IPv4
   Pkt* k = (Pkt*)malloc(sizeof(Pkt) + n); if (!k) return;
   k->from = from;
-  k->port = p.remotePort(); k->fromUpstream = fromUpstream; k->len = n;
+  k->port = p.remotePort(); k->fromUpstream = fromUpstream; k->viaDot = false; k->len = n;
   memcpy(k->data, p.data(), n);
   if (xQueueSend(pktQ, &k, 0) != pdTRUE) free(k);  // full: drop, the client retries
 }
@@ -136,18 +137,37 @@ struct Pending {
   uint16_t wid, cport, plen, ql; uint8_t cid0, cid1; Addr client; uint32_t t0;
   uint8_t pkt[300];                                // whole query (for the retry); ql = question bytes after the header
   uint64_t ckey;                                   // answer-cache key, 0 = don't cache the reply
+  uint16_t maxUdp;                                 // biggest answer the client takes over UDP
 };
 static Pending pending[MAX_PENDING];
 int upActive = 0;
 static uint8_t upMisses[2] = { 0, 0 }; static uint32_t upSwitchedAt = 0;
 
 static int upstreamIndex(uint32_t ip) { for (int i = 0; i < 2; i++) if (upstream[i] && upstream[i] == ip) return i; return -1; }
+uint32_t dotFallbacks = 0;                         // queries sent as plain DNS while DoT was on
+// Sends the query in buf (DNS id = wid) towards upstream u: through the DoT connection when it's
+// enabled and up, else as plain UDP -- unless strict, then not at all (returns false).
+static bool transmit(int len, uint16_t wid, int u) {
+  if (dotEnabled) {
+    if (dotSend(buf, len, wid, -1)) return true;
+    if (dotStrict) return false;
+    dotFallbacks++;
+  }
+  sendUpstream(upstream[u], len);
+  return true;
+}
 static void sendPending(Pending& p, int u) {
   memcpy(buf, p.pkt, p.plen);
-  sendUpstream(upstream[u], p.plen);
+  transmit(p.plen, p.wid, u);
   p.sentMask |= 1 << u;
 }
-static void forwardUpstream(const Addr& client, uint16_t cport, int qlen, int qend, uint64_t ckey) {
+static int buildServfail(int qend) {               // strict DoT with no connection: fail fast
+  buf[2] = 0x81; buf[3] = 0x82; buf[6] = buf[7] = buf[8] = buf[9] = buf[10] = buf[11] = 0;
+  if (qend <= 12) { buf[4] = buf[5] = 0; return 12; }
+  return qend;
+}
+// Returns false if the query could not be sent (strict DoT without a connection).
+static bool forwardUpstream(const Addr& client, uint16_t cport, int qlen, int qend, uint64_t ckey) {
   Pending* p = nullptr;
   for (int i = 0; i < MAX_PENDING; i++) {          // free slot, else evict the oldest
     if (!pending[i].used) { p = &pending[i]; break; }
@@ -166,8 +186,16 @@ static void forwardUpstream(const Addr& client, uint16_t cport, int qlen, int qe
   p->ql = (fits && qend > 12 && qend <= qlen) ? qend - 12 : 0;
   if (fits) memcpy(p->pkt, buf, qlen);
   p->ckey = p->ql ? ckey : 0;
-  sendUpstream(upstream[upActive], qlen);
+  // Over DoT the upstream never truncates, so the answer may be bigger than this client takes
+  // over UDP: 512 bytes, or its EDNS size (capped at 1232, the DNS flag-day value).
+  p->maxUdp = 512;
+  if (qend > 12 && qend + 11 <= qlen && ((buf[10] << 8) | buf[11]) && buf[qend] == 0 && buf[qend + 1] == 0 && buf[qend + 2] == 41) {
+    const uint16_t e = (buf[qend + 3] << 8) | buf[qend + 4];
+    p->maxUdp = e < 512 ? 512 : e > 1232 ? 1232 : e;
+  }
   p->sentMask = 1 << upActive;
+  if (!transmit(qlen, wid, upActive)) { p->used = false; return false; }
+  return true;
 }
 // ---------- client names from the router's reverse DNS ----------
 // Home routers answer PTR queries for LAN addresses with the DHCP hostname ("laptop.home").
@@ -231,18 +259,24 @@ static void maybeRequestName(Dev* c) {
   if (c->nameState == 0 || (!c->name.length() && millis() - c->nameAt > NAME_RETRY_MS)) requestName(*c);
 }
 
-static void handleReply(const Addr& from, uint16_t port, int n) {
+// viaDot: the answer came over the authenticated TLS connection, so it needn't come from the
+// exact upstream the query was first sent to (failover may have moved the connection).
+static void handleReply(const Addr& from, uint16_t port, int n, bool viaDot) {
   uint32_t ip; memcpy(&ip, from.b, 4);
   if (port != UPSTREAM_PORT) return;
   int u = upstreamIndex(ip);
   const uint16_t wid = (buf[0] << 8) | buf[1];
-  for (int i = 0; u >= 0 && i < MAX_PENDING; i++) {
+  for (int i = 0; (u >= 0 || viaDot) && i < MAX_PENDING; i++) {
     Pending& p = pending[i];
-    if (!p.used || p.wid != wid || !(p.sentMask & (1 << u))) continue;
+    if (!p.used || p.wid != wid || (!viaDot && !(p.sentMask & (1 << u)))) continue;
     if (p.ql && (n < 12 + p.ql || memcmp(buf + 12, p.pkt + 12, p.ql) != 0)) return;
     buf[0] = p.cid0; buf[1] = p.cid1; p.used = false;
-    upMisses[u] = 0;
+    if (u >= 0) upMisses[u] = 0;
     cacheStore(buf, p.ckey, n, p.ql);
+    if (n > p.maxUdp) {                            // too big for UDP: truncated, client retries over TCP
+      buf[2] |= 0x02; buf[6] = buf[7] = buf[8] = buf[9] = buf[10] = buf[11] = 0;
+      if (p.ql) n = 12 + p.ql; else { buf[4] = buf[5] = 0; n = 12; }
+    }
     sendClient(p.client, p.cport, n);
     return;
   }
@@ -282,6 +316,7 @@ void loadUpstreams() {
 void setUpstreams(uint32_t primary, uint32_t secondary) {
   upstream[0] = primary; upstream[1] = secondary;
   upActive = 0; upMisses[0] = upMisses[1] = 0;
+  dotRestart();
   File f = LittleFS.open(UPSTREAM_CFG, "w"); if (!f) return;
   f.println(IPAddress(upstream[0]).toString());
   f.println(upstream[1] ? IPAddress(upstream[1]).toString() : String(""));
@@ -326,7 +361,24 @@ static void handleQuery(const Addr& client, uint16_t cport, int qlen) {
   int qend; uint64_t key;
   int rlen = answerLocally(client, qlen, false, &qend, &key);
   if (rlen) sendClient(client, cport, rlen);
-  else      forwardUpstream(client, cport, qlen, qend, key);
+  else if (!forwardUpstream(client, cport, qlen, qend, key))   // strict DoT, no connection
+    sendClient(client, cport, buildServfail(qend));
+}
+
+// Answers from the DoT task (another task: only the queue is shared). Bigger than buf: keep
+// the header and question with TC set -- only UDP-bound answers come this way.
+void dnsInjectReply(const uint8_t* data, int len, uint32_t fromIp) {
+  int n = len;
+  if (n > (int)sizeof(buf)) {
+    int pos = 12;
+    while (pos < len && data[pos]) pos += data[pos] + 1;
+    n = pos + 5 <= len ? pos + 5 : 12;
+  }
+  Pkt* k = (Pkt*)malloc(sizeof(Pkt) + n); if (!k) return;
+  k->from = addrV4(fromIp); k->port = UPSTREAM_PORT; k->fromUpstream = true; k->viaDot = true; k->len = n;
+  memcpy(k->data, data, n);
+  if (n < len) { k->data[2] |= 0x02; memset(k->data + 6, 0, 6); if (n == 12) k->data[4] = k->data[5] = 0; }
+  if (xQueueSend(pktQ, &k, 0) != pdTRUE) free(k);
 }
 
 // ---------- DNS over TCP (RFC 7766) ----------
@@ -339,19 +391,31 @@ static void handleQuery(const Addr& client, uint16_t cport, int qlen) {
 static const int MAX_TCP = 3;
 static const uint32_t TCP_IDLE_MS = 10000;
 static const int TCP_MAX_QUERY = 512;
-enum TcpState : uint8_t { T_FREE, T_READ, T_CONNECT, T_SENDQ, T_RELAY_LEN, T_RELAY };
+enum TcpState : uint8_t { T_FREE, T_READ, T_CONNECT, T_SENDQ, T_RELAY_LEN, T_RELAY, T_WAIT_DOT, T_SEND_BIG };
 struct TcpConn {
   TcpState st; int cfd, ufd; Addr client; uint32_t t; int upIdx; bool triedOther;
   uint16_t qlen, have;                             // query: 2-byte length + body, read so far
   uint8_t q[2 + TCP_MAX_QUERY];
   uint32_t left;                                   // answer bytes still to relay
   uint16_t outLen, outOff; uint8_t out[512];       // chunk waiting to be written to the client
+  uint16_t wid; uint8_t cid0, cid1;                // DoT: id used upstream, client's own id
+  uint8_t* big; uint16_t bigLen, bigOff;           // DoT: whole answer being written out
 };
 static TcpConn tcpConns[MAX_TCP];
 static int tcpListen = -1;
 
 static void tcpCloseUp(TcpConn& c) { if (c.ufd >= 0) { close(c.ufd); c.ufd = -1; } }
-static void tcpClose(TcpConn& c) { tcpCloseUp(c); if (c.cfd >= 0) close(c.cfd); c.cfd = -1; c.st = T_FREE; }
+static void tcpClose(TcpConn& c) {
+  tcpCloseUp(c); if (c.cfd >= 0) close(c.cfd);
+  free(c.big); c.big = nullptr; c.cfd = -1; c.st = T_FREE;
+}
+// DoT answers for TCP clients, handed over by the DoT task (whole, up to 16 KB).
+struct TcpReply { int8_t slot; uint16_t wid; uint16_t len; uint8_t* data; };
+static QueueHandle_t tcpReplyQ;
+void dnsTcpReply(int slot, uint16_t wid, uint8_t* data, int len) {
+  TcpReply r = { (int8_t)slot, wid, (uint16_t)len, data };
+  if (!tcpReplyQ || xQueueSend(tcpReplyQ, &r, 0) != pdTRUE) free(data);
+}
 static void nonBlocking(int fd) { fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK); }
 // Writes as much of c.out as the socket takes; true once it's all gone.
 static bool tcpFlush(TcpConn& c) {
@@ -390,6 +454,19 @@ static void tcpQueryComplete(TcpConn& c) {
     c.have = 0; c.st = T_READ;
     tcpFlush(c);
     return;
+  }
+  if (dotEnabled) {                                // over the DoT connection, under a fresh id
+    c.cid0 = c.q[2]; c.cid1 = c.q[3];
+    c.wid = (uint16_t)esp_random(); c.q[2] = c.wid >> 8; c.q[3] = c.wid & 0xFF;
+    if (dotSend(c.q + 2, c.qlen, c.wid, &c - tcpConns)) { c.st = T_WAIT_DOT; c.t = millis(); return; }
+    c.q[2] = c.cid0; c.q[3] = c.cid1;
+    if (dotStrict) {                               // no plain DNS allowed: SERVFAIL
+      int rlen = buildServfail(qend);
+      c.out[0] = rlen >> 8; c.out[1] = rlen & 0xFF; memcpy(c.out + 2, buf, rlen);
+      c.outLen = rlen + 2; c.outOff = 0; c.have = 0; c.st = T_READ; tcpFlush(c);
+      return;
+    }
+    dotFallbacks++;
   }
   c.triedOther = false;
   if (!tcpConnectUp(c, upActive)) tcpUpFailed(c);
@@ -455,6 +532,19 @@ static void tcpService(TcpConn& c) {
       tcpFlush(c);
       return;
     }
+    case T_WAIT_DOT:                               // answer arrives via tcpReplyQ (handleTcp)
+      if (now - c.t > 5000) tcpClose(c);
+      return;
+    case T_SEND_BIG: {
+      while (c.bigOff < c.bigLen) {
+        int n = send(c.cfd, c.big + c.bigOff, c.bigLen - c.bigOff, MSG_DONTWAIT);
+        if (n > 0) { c.bigOff += n; c.t = now; continue; }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+        tcpClose(c); return;
+      }
+      free(c.big); c.big = nullptr; c.have = 0; c.st = T_READ;   // next query on this connection
+      return;
+    }
     default: return;
   }
 }
@@ -462,6 +552,15 @@ static void tcpService(TcpConn& c) {
 static bool handleTcp() {
   if (tcpListen < 0) return false;
   bool did = false;
+  TcpReply r;
+  while (xQueueReceive(tcpReplyQ, &r, 0) == pdTRUE) {
+    TcpConn& c = tcpConns[r.slot];
+    if (c.st != T_WAIT_DOT || c.wid != r.wid) { free(r.data); continue; }   // client gave up
+    r.data[0] = c.cid0; r.data[1] = c.cid1;
+    c.out[0] = r.len >> 8; c.out[1] = r.len & 0xFF; c.outLen = 2; c.outOff = 0;
+    c.big = r.data; c.bigLen = r.len; c.bigOff = 0; c.st = T_SEND_BIG; c.t = millis();
+    did = true;
+  }
   struct sockaddr_in6 sa; socklen_t sl = sizeof(sa);
   int fd = accept(tcpListen, (struct sockaddr*)&sa, &sl);
   if (fd >= 0) {
@@ -471,7 +570,7 @@ static bool handleTcp() {
     if (!c) close(fd);                             // all busy: the client retries
     else {
       nonBlocking(fd);
-      *c = {}; c->cfd = fd; c->ufd = -1; c->st = T_READ; c->t = millis();
+      *c = {}; c->cfd = fd; c->ufd = -1; c->st = T_READ; c->t = millis(); c->big = nullptr;
       c->client = {};
       const uint8_t* a = (const uint8_t*)&sa.sin6_addr;
       if (sa.sin6_family == AF_INET) memcpy(c->client.b, &((struct sockaddr_in*)&sa)->sin_addr, 4);
@@ -483,7 +582,8 @@ static bool handleTcp() {
   return did;                                      // open connections alone don't keep loop() from idling
 }
 static void tcpBegin() {
-  for (int i = 0; i < MAX_TCP; i++) { tcpConns[i].st = T_FREE; tcpConns[i].cfd = tcpConns[i].ufd = -1; }
+  tcpReplyQ = xQueueCreate(8, sizeof(TcpReply));
+  for (int i = 0; i < MAX_TCP; i++) { tcpConns[i].st = T_FREE; tcpConns[i].cfd = tcpConns[i].ufd = -1; tcpConns[i].big = nullptr; }
   int fd = socket(AF_INET6, SOCK_STREAM, 0); if (fd < 0) return;
   int off = 0; setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));   // dual-stack: IPv4 too
   int on = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
@@ -500,6 +600,7 @@ void dnsBegin() {
   dnsSock.onPacket([](AsyncUDPPacket& p) { enqueuePkt(p, false); });
   upstreamSock.onPacket([](AsyncUDPPacket& p) { enqueuePkt(p, true); });
   tcpBegin();
+  dotBegin();
 }
 // Drain a burst per call (capped, so web/OTA still get a turn). Returns true if it did work.
 // Called by loop() when idle: sleeps up to ms but wakes as soon as a packet is queued
@@ -510,7 +611,7 @@ bool handleDns() {
   for (int budget = 0; budget < 32 && xQueueReceive(pktQ, &k, 0) == pdTRUE; budget++) {
     did = true;
     memcpy(buf, k->data, k->len);
-    if (k->fromUpstream) handleReply(k->from, k->port, k->len);
+    if (k->fromUpstream) handleReply(k->from, k->port, k->len, k->viaDot);
     else                 handleQuery(k->from, k->port, k->len);
     free(k);
   }
